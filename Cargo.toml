@@ -107,7 +107,7 @@ wasm-opt = ["--enable-threads", "--enable-bulk-memory", "-Oz"]
 #virtual-fs = { git = "https://github.com/wasmerio/wasmer", branch = "master" }
 #wasmer-wasix = { git = "https://github.com/wasmerio/wasmer", branch = "master" }
 #wasmer = { git = "https://github.com/wasmerio/wasmer", branch = "master" }
-webc = { path = "../pirita/crates/webc" }
+webc = { path = "../webc" }
 virtual-net = { path = "../wasmer/lib/virtual-net" }
 virtual-fs = { path = "../wasmer/lib/virtual-fs" }
 wasmer-wasix = { path = "../wasmer/lib/wasix" }
