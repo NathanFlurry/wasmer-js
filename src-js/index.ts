@@ -1,4 +1,5 @@
 export * from "../pkg/wasmer_js";
+export { createVFS, type VFS, type VfsStat, type VfsDirEntry } from "./vfs";
 // @ts-ignore
 import load, {
   InitInput,
