@@ -224,7 +224,7 @@ impl Command {
         let options = options.unwrap_or_default();
 
         let mut runner = WasiRunner::new();
-        let (stdin, stdout, stderr) = configure_runner(&options, &mut runner, &runtime).await?;
+        let (stdin, stdout, stderr, fs) = configure_runner(&options, &mut runner, &runtime).await?;
         let command_name = String::from(&self.name);
 
         tracing::debug!(%command_name, "Starting the WASI runner");
@@ -244,6 +244,7 @@ impl Command {
             stdout,
             stderr,
             exit: receiver,
+            fs,
         })
     }
 
@@ -296,6 +297,7 @@ pub(crate) async fn configure_runner(
         Option<web_sys::WritableStream>,
         web_sys::ReadableStream,
         web_sys::ReadableStream,
+        virtual_fs::TmpFileSystem,
     ),
     Error,
 > {
@@ -312,8 +314,15 @@ pub(crate) async fn configure_runner(
         runner.with_current_dir(cwd);
     }
 
+    // Create a TmpFileSystem that mirrors the mounts for VFS access
+    let fs = virtual_fs::TmpFileSystem::new();
     for (dest, dir) in options.mounted_directories()? {
-        runner.with_mount(dest, Arc::new(dir));
+        let dir_arc: Arc<dyn virtual_fs::FileSystem + Send + Sync> = Arc::new(dir);
+        // Mount to our TmpFileSystem for VFS access
+        fs.mount(dest.clone().into(), &dir_arc, "/".into())
+            .with_context(|| format!("Unable to mount to \"{}\"", dest))?;
+        // Also mount to the runner
+        runner.with_mount(dest, dir_arc);
     }
 
     if let Some(uses) = options.uses() {
@@ -337,7 +346,7 @@ pub(crate) async fn configure_runner(
             runner.with_stdin(Box::new(stdin_pipe));
             runner.with_stdout(Box::new(stdout_pipe));
             runtime.set_connected_to_tty(true);
-            Ok((Some(stdin_stream), stdout_stream, stderr_stream))
+            Ok((Some(stdin_stream), stdout_stream, stderr_stream, fs))
         }
         TerminalMode::NonInteractive { stdin } => {
             tracing::debug!("Setting up non-interactive TTY");
@@ -352,7 +361,7 @@ pub(crate) async fn configure_runner(
             // for wasmer-wasix to work out.
             runtime.set_connected_to_tty(false);
 
-            Ok((None, stdout_stream, stderr_stream))
+            Ok((None, stdout_stream, stderr_stream, fs))
         }
     }
 }

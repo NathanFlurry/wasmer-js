@@ -1,5 +1,8 @@
+use anyhow::Context;
 use futures::{channel::oneshot::Receiver, Stream, StreamExt, TryFutureExt};
 use js_sys::Uint8Array;
+use std::path::Path;
+use virtual_fs::{AsyncReadExt, AsyncWriteExt, FileSystem, TmpFileSystem};
 use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsValue};
 use wasmer_wasix::WasiRuntimeError;
 
@@ -20,6 +23,8 @@ pub struct Instance {
     #[wasm_bindgen(getter_with_clone, readonly)]
     pub stderr: web_sys::ReadableStream,
     pub(crate) exit: Receiver<ExitCondition>,
+    /// The virtual filesystem for this instance.
+    pub(crate) fs: TmpFileSystem,
 }
 
 #[wasm_bindgen]
@@ -29,6 +34,146 @@ impl Instance {
     pub async fn js_wait(self) -> Result<JsOutput, Error> {
         let output = self.wait().await?;
         Ok(output.into())
+    }
+
+    /// Read the contents of a file as binary data.
+    #[wasm_bindgen(js_name = "vfsReadFile")]
+    pub async fn vfs_read_file(&self, path: String) -> Result<Uint8Array, Error> {
+        let buffer = self.read_file_internal(&path).await?;
+        Ok(Uint8Array::from(&buffer[..]))
+    }
+
+    /// Read the contents of a file as UTF-8 text.
+    #[wasm_bindgen(js_name = "vfsReadTextFile")]
+    pub async fn vfs_read_text_file(&self, path: String) -> Result<js_sys::JsString, Error> {
+        let buffer = self.read_file_internal(&path).await?;
+        let string = String::from_utf8(buffer)
+            .with_context(|| format!("File '{}' is not valid UTF-8", path))?;
+        Ok(string.into())
+    }
+
+    /// Write binary data to a file, creating it if it doesn't exist, or truncating if it does.
+    #[wasm_bindgen(js_name = "vfsWriteFile")]
+    pub async fn vfs_write_file(&self, path: String, content: &[u8]) -> Result<(), Error> {
+        let path_obj = Path::new(&path);
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = path_obj.parent() {
+            self.create_dir_all_internal(parent)
+                .with_context(|| format!("Failed to create parent directories for '{}'", path))?;
+        }
+
+        let mut file = self
+            .fs
+            .new_open_options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path_obj)
+            .with_context(|| format!("Failed to create '{}'", path))?;
+
+        file.write_all(content)
+            .await
+            .with_context(|| format!("Failed to write '{}'", path))?;
+
+        file.flush()
+            .await
+            .with_context(|| format!("Failed to flush '{}'", path))?;
+
+        Ok(())
+    }
+
+    /// Write a UTF-8 string to a file.
+    #[wasm_bindgen(js_name = "vfsWriteTextFile")]
+    pub async fn vfs_write_text_file(&self, path: String, content: &str) -> Result<(), Error> {
+        self.vfs_write_file(path, content.as_bytes()).await
+    }
+
+    /// Check if a path exists (file or directory).
+    #[wasm_bindgen(js_name = "vfsExists")]
+    pub fn vfs_exists(&self, path: &str) -> bool {
+        self.fs.metadata(Path::new(path)).is_ok()
+    }
+
+    /// Get metadata about a file or directory.
+    #[wasm_bindgen(js_name = "vfsStat")]
+    pub fn vfs_stat(&self, path: &str) -> Result<JsValue, Error> {
+        let path_obj = Path::new(path);
+        let metadata = self
+            .fs
+            .metadata(path_obj)
+            .with_context(|| format!("Failed to stat '{}'", path))?;
+
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(&obj, &"isFile".into(), &metadata.is_file().into()).unwrap();
+        js_sys::Reflect::set(&obj, &"isDir".into(), &metadata.is_dir().into()).unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &"size".into(),
+            &JsValue::from_f64(metadata.len() as f64),
+        )
+        .unwrap();
+
+        Ok(obj.into())
+    }
+
+    /// List contents of a directory.
+    #[wasm_bindgen(js_name = "vfsReadDir")]
+    pub fn vfs_read_dir(&self, path: &str) -> Result<js_sys::Array, Error> {
+        let path_obj = Path::new(path);
+        let entries = self
+            .fs
+            .read_dir(path_obj)
+            .with_context(|| format!("Failed to read dir '{}'", path))?;
+
+        let arr = js_sys::Array::new();
+        for entry in entries {
+            let entry = entry.context("Failed to read directory entry")?;
+
+            let obj = js_sys::Object::new();
+            let name = entry
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            js_sys::Reflect::set(&obj, &"name".into(), &name.into()).unwrap();
+            js_sys::Reflect::set(
+                &obj,
+                &"path".into(),
+                &entry.path.to_string_lossy().into_owned().into(),
+            )
+            .unwrap();
+
+            arr.push(&obj);
+        }
+
+        Ok(arr)
+    }
+
+    /// Create a directory and all parent directories.
+    #[wasm_bindgen(js_name = "vfsMkdir")]
+    pub fn vfs_mkdir(&self, path: &str) -> Result<(), Error> {
+        self.create_dir_all_internal(Path::new(path))
+            .with_context(|| format!("Failed to mkdir '{}'", path))?;
+        Ok(())
+    }
+
+    /// Remove a file.
+    #[wasm_bindgen(js_name = "vfsRemoveFile")]
+    pub fn vfs_remove_file(&self, path: &str) -> Result<(), Error> {
+        self.fs
+            .remove_file(Path::new(path))
+            .with_context(|| format!("Failed to remove '{}'", path))?;
+        Ok(())
+    }
+
+    /// Remove an empty directory.
+    #[wasm_bindgen(js_name = "vfsRemoveDir")]
+    pub fn vfs_remove_dir(&self, path: &str) -> Result<(), Error> {
+        self.fs
+            .remove_dir(Path::new(path))
+            .with_context(|| format!("Failed to rmdir '{}'", path))?;
+        Ok(())
     }
 }
 
@@ -40,6 +185,7 @@ impl Instance {
             stdout,
             stderr,
             exit,
+            fs: _,
         } = self;
 
         if let Some(stdin) = stdin {
@@ -82,6 +228,39 @@ impl Instance {
         };
 
         Ok(output)
+    }
+
+    /// Internal helper to read a file.
+    async fn read_file_internal(&self, path: &str) -> Result<Vec<u8>, Error> {
+        let path_obj = Path::new(path);
+        let mut file = self
+            .fs
+            .new_open_options()
+            .read(true)
+            .open(path_obj)
+            .with_context(|| format!("Failed to open '{}'", path))?;
+
+        let mut buffer = Vec::with_capacity(file.size() as usize);
+        file.read_to_end(&mut buffer)
+            .await
+            .with_context(|| format!("Failed to read '{}'", path))?;
+
+        Ok(buffer)
+    }
+
+    /// Internal helper to create directories recursively.
+    fn create_dir_all_internal(&self, path: &Path) -> Result<(), virtual_fs::FsError> {
+        if path.as_os_str().is_empty() || self.fs.metadata(path).is_ok() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            self.create_dir_all_internal(parent)?;
+        }
+        match self.fs.create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(virtual_fs::FsError::AlreadyExists) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -208,6 +387,31 @@ export type Output = {
 }
 "#;
 
+#[wasm_bindgen(typescript_custom_section)]
+const VFS_TYPE_DEFINITIONS: &'static str = r#"
+/**
+ * Metadata about a file or directory in the VFS.
+ */
+export type VfsStat = {
+    /** Is this path a file? */
+    isFile: boolean;
+    /** Is this path a directory? */
+    isDir: boolean;
+    /** Size of the file in bytes (0 for directories). */
+    size: number;
+}
+
+/**
+ * An entry in a directory listing.
+ */
+export type VfsDirEntry = {
+    /** The name of the file or directory. */
+    name: string;
+    /** The full path to the entry. */
+    path: string;
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use futures::channel::oneshot;
@@ -228,6 +432,7 @@ mod tests {
             stdout: stdout_stream,
             stderr: stderr_stream,
             exit,
+            fs: TmpFileSystem::new(),
         };
         dbg!(&instance);
 

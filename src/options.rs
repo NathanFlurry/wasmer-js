@@ -178,7 +178,7 @@ extern "C" {
 
 impl RunOptions {
     /// Propagate any provided options to the [`WasiEnvBuilder`], returning
-    /// streams that can be used for stdin/stdout/stderr.
+    /// streams that can be used for stdin/stdout/stderr, along with the filesystem.
     pub(crate) fn configure_builder(
         &self,
         builder: &mut WasiEnvBuilder,
@@ -187,6 +187,7 @@ impl RunOptions {
             Option<web_sys::WritableStream>,
             web_sys::ReadableStream,
             web_sys::ReadableStream,
+            TmpFileSystem,
         ),
         Error,
     > {
@@ -218,10 +219,12 @@ impl RunOptions {
         builder.set_stderr(Box::new(stderr_file));
 
         let fs = self.filesystem()?;
+        // Clone the filesystem so we can return it while also giving one to the builder
+        let fs_for_instance = fs.clone();
         builder.set_fs(Box::new(fs));
         builder.add_preopen_dir("/")?;
 
-        Ok((stdin, stdout, stderr))
+        Ok((stdin, stdout, stderr, fs_for_instance))
     }
 
     pub(crate) fn filesystem(&self) -> Result<TmpFileSystem, Error> {
