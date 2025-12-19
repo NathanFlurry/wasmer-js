@@ -504,25 +504,33 @@ impl SchedulerState {
 
                 Ok(())
             }
-            SchedulerMessage::HostExecChildOutput { worker_id: _, request_id: _, session_id, child_id, msg_type, data } => {
-                tracing::debug!(session_id, child_id, msg_type, data_len = data.len(), "Received host_exec_child_output");
+            SchedulerMessage::HostExecChildOutput { worker_id: _, request_id: _, session_id: _, child_id, msg_type, data } => {
+                web_sys::console::warn_1(&format!(
+                    "[scheduler] HostExecChildOutput child_id={} msg_type={} data_len={}",
+                    child_id, msg_type, data.len()
+                ).into());
 
-                // Look up the child output handlers for this session and call appropriate callback
+                // Look up the child output handlers by child_id and call appropriate callback
+                // Callbacks expect (data) not (child_id, data) - child_id is implicit
                 CHILD_OUTPUT_HANDLERS.with(|handlers| {
-                    if let Some((stdout_fn, stderr_fn, exit_fn)) = handlers.borrow().get(&session_id) {
-                        let child_id_val = JsValue::from_f64(child_id as f64);
-
+                    if let Some((stdout_fn, stderr_fn, exit_fn)) = handlers.borrow().get(&child_id) {
                         match msg_type {
                             MSG_TYPE_CHILD_STDOUT => {
                                 let data_array = js_sys::Uint8Array::from(data.as_slice());
-                                if let Err(e) = stdout_fn.call2(&JsValue::NULL, &child_id_val, &data_array) {
-                                    tracing::warn!(session_id, child_id, ?e, "Failed to call onChildStdout");
+                                if let Err(e) = stdout_fn.call1(&JsValue::NULL, &data_array) {
+                                    web_sys::console::warn_1(&format!(
+                                        "[scheduler] Failed to call onChildStdout for child {}: {:?}",
+                                        child_id, e
+                                    ).into());
                                 }
                             }
                             MSG_TYPE_CHILD_STDERR => {
                                 let data_array = js_sys::Uint8Array::from(data.as_slice());
-                                if let Err(e) = stderr_fn.call2(&JsValue::NULL, &child_id_val, &data_array) {
-                                    tracing::warn!(session_id, child_id, ?e, "Failed to call onChildStderr");
+                                if let Err(e) = stderr_fn.call1(&JsValue::NULL, &data_array) {
+                                    web_sys::console::warn_1(&format!(
+                                        "[scheduler] Failed to call onChildStderr for child {}: {:?}",
+                                        child_id, e
+                                    ).into());
                                 }
                             }
                             MSG_TYPE_CHILD_EXIT => {
@@ -532,17 +540,30 @@ impl SchedulerState {
                                 } else {
                                     0
                                 };
+                                web_sys::console::warn_1(&format!(
+                                    "[scheduler] Calling onChildExit for child {} with code {}",
+                                    child_id, exit_code
+                                ).into());
                                 let exit_code_val = JsValue::from_f64(exit_code as f64);
-                                if let Err(e) = exit_fn.call2(&JsValue::NULL, &child_id_val, &exit_code_val) {
-                                    tracing::warn!(session_id, child_id, ?e, "Failed to call onChildExit");
+                                if let Err(e) = exit_fn.call1(&JsValue::NULL, &exit_code_val) {
+                                    web_sys::console::warn_1(&format!(
+                                        "[scheduler] Failed to call onChildExit for child {}: {:?}",
+                                        child_id, e
+                                    ).into());
                                 }
                             }
                             _ => {
-                                tracing::warn!(session_id, child_id, msg_type, "Unknown child output message type");
+                                web_sys::console::warn_1(&format!(
+                                    "[scheduler] Unknown child output message type {} for child {}",
+                                    msg_type, child_id
+                                ).into());
                             }
                         }
                     } else {
-                        tracing::warn!(session_id, "No child output handlers found for session");
+                        web_sys::console::warn_1(&format!(
+                            "[scheduler] No child output handlers found for child_id {}",
+                            child_id
+                        ).into());
                     }
                 });
 
@@ -889,18 +910,47 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
     }
 
     // Create requestSpawn callback - Node calls this to spawn a child process inside WASM
-    // Returns a child_id that can be used to identify the child
+    // Parameters: childId, command, argsJson, envJson, cwd, onStdout, onStderr, onExit
     let spawn_scheduler = scheduler.clone();
-    let request_spawn: Closure<dyn Fn(JsValue, JsValue, JsValue, JsValue) -> JsValue> = Closure::new(move |command: JsValue, args: JsValue, env: JsValue, cwd: JsValue| {
-        // Generate unique child ID
-        let child_id = NEXT_CHILD_ID.fetch_add(1, Ordering::SeqCst);
+    let request_spawn: Closure<dyn Fn(JsValue, JsValue, JsValue, JsValue, JsValue, JsValue, JsValue, JsValue)> = Closure::new(move |child_id_val: JsValue, command: JsValue, args_json: JsValue, env_json: JsValue, cwd: JsValue, on_stdout: JsValue, on_stderr: JsValue, on_exit: JsValue| {
+        // Get child ID from JavaScript (already generated there)
+        let child_id = child_id_val.as_f64().unwrap_or(0.0) as u64;
 
-        // Build spawn request JSON
+        web_sys::console::warn_1(&format!(
+            "[scheduler] requestSpawn child_id={} command={:?}",
+            child_id, command.as_string()
+        ).into());
+
+        // Store the output callbacks for this child, keyed by child_id
+        // Each child has its own set of callbacks
+        if let (Ok(stdout_fn), Ok(stderr_fn), Ok(exit_fn)) = (
+            on_stdout.dyn_into::<js_sys::Function>(),
+            on_stderr.dyn_into::<js_sys::Function>(),
+            on_exit.dyn_into::<js_sys::Function>(),
+        ) {
+            CHILD_OUTPUT_HANDLERS.with(|handlers| {
+                handlers.borrow_mut().insert(child_id, (stdout_fn, stderr_fn, exit_fn));
+                web_sys::console::warn_1(&format!(
+                    "[scheduler] Stored callbacks for child_id {}",
+                    child_id
+                ).into());
+            });
+        } else {
+            web_sys::console::warn_1(&"[scheduler] requestSpawn: failed to get callback functions".into());
+        }
+
+        // Build spawn request JSON - parse args and env from JSON strings
         let spawn_request = js_sys::Object::new();
         js_sys::Reflect::set(&spawn_request, &JsValue::from_str("child_id"), &JsValue::from_f64(child_id as f64)).ok();
         js_sys::Reflect::set(&spawn_request, &JsValue::from_str("command"), &command).ok();
-        js_sys::Reflect::set(&spawn_request, &JsValue::from_str("args"), &args).ok();
-        js_sys::Reflect::set(&spawn_request, &JsValue::from_str("env"), &env).ok();
+        // args_json is already a JSON string, parse it to get the array
+        if let Ok(args_array) = js_sys::JSON::parse(&args_json.as_string().unwrap_or_default()) {
+            js_sys::Reflect::set(&spawn_request, &JsValue::from_str("args"), &args_array).ok();
+        }
+        // env_json is already a JSON string, parse it to get the object
+        if let Ok(env_obj) = js_sys::JSON::parse(&env_json.as_string().unwrap_or_default()) {
+            js_sys::Reflect::set(&spawn_request, &JsValue::from_str("env"), &env_obj).ok();
+        }
         js_sys::Reflect::set(&spawn_request, &JsValue::from_str("cwd"), &cwd).ok();
 
         // Serialize to JSON bytes
@@ -908,6 +958,11 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
             .map(|s| s.as_string().unwrap_or_default())
             .unwrap_or_default();
         let json_bytes = json_str.into_bytes();
+
+        web_sys::console::warn_1(&format!(
+            "[scheduler] requestSpawn queuing SPAWN_REQUEST len={}",
+            json_bytes.len()
+        ).into());
 
         // Queue spawn request for WASM to read
         OUTPUT_QUEUES.lock().unwrap()
@@ -930,8 +985,6 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
                 let _ = spawn_scheduler.send(msg);
             }
         }
-
-        JsValue::from_f64(child_id as f64)
     });
     js_sys::Reflect::set(&obj, &JsValue::from_str("requestSpawn"), &request_spawn.into_js_value()).ok();
 

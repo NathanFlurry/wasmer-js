@@ -8,6 +8,7 @@
   "compilerOptions": {
     "target": "esnext",
     "lib": ["esnext", "DOM"],
+    "types": ["node"],
     "rootDir": "src-js",
     "module": "esnext",
     "noEmit": false,

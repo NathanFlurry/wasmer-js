@@ -438,7 +438,22 @@ impl HostExecRuntime for HostExecImpl {
                             Ok(HostExecOutput::Stderr(data))
                         }
                     }
-                    _ => Err(anyhow::anyhow!("Unknown message type: {}", msg_type)),
+                    _ => {
+                        // Unknown message type - pass through as Raw for WASM to handle
+                        // This includes SPAWN_REQUEST (10), SPAWN_STDIN (11), etc.
+                        let data_len = data_len_or_exit_code as usize;
+                        let mut data = vec![0u8; data_len];
+
+                        // Read data bytes from buffer starting at index 4 (byte offset 16)
+                        let buffer = view.buffer();
+                        let uint8_view = js_sys::Uint8Array::new(&buffer);
+
+                        for i in 0..data_len {
+                            data[i] = uint8_view.get_index((16 + i) as u32) as u8;
+                        }
+
+                        Ok(HostExecOutput::Raw { msg_type, data })
+                    }
                 }
             })
         })
@@ -595,7 +610,22 @@ impl HostExecRuntime for HostExecImpl {
                             Ok(Some(HostExecOutput::Stderr(data)))
                         }
                     }
-                    _ => Err(anyhow::anyhow!("Unknown message type: {}", msg_type)),
+                    _ => {
+                        // Unknown message type - pass through as Raw for WASM to handle
+                        // This includes SPAWN_REQUEST (10), SPAWN_STDIN (11), etc.
+                        let data_len = data_len_or_exit_code as usize;
+                        let mut data = vec![0u8; data_len];
+
+                        // Read data bytes from buffer starting at index 4 (byte offset 16)
+                        let buffer = view.buffer();
+                        let uint8_view = js_sys::Uint8Array::new(&buffer);
+
+                        for i in 0..data_len {
+                            data[i] = uint8_view.get_index((16 + i) as u32) as u8;
+                        }
+
+                        Ok(Some(HostExecOutput::Raw { msg_type, data }))
+                    }
                 }
             })
         })
