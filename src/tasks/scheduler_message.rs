@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use derivative::Derivative;
-use js_sys::WebAssembly;
+use js_sys::{Uint8Array, WebAssembly};
 use wasm_bindgen::JsValue;
 use wasmer::AsJs;
 use wasmer_types::ModuleHash;
@@ -31,6 +31,41 @@ pub(crate) enum SchedulerMessage {
     WorkerIdle { worker_id: u32 },
     /// Mark a worker as busy.
     WorkerBusy { worker_id: u32 },
+    /// Host execution request from worker.
+    HostExecStart {
+        /// The worker that sent this request.
+        worker_id: u32,
+        /// Unique request ID for matching response.
+        request_id: u64,
+        /// JSON-encoded HostExecRequest.
+        request_json: Vec<u8>,
+    },
+    /// Host execution read request.
+    HostExecRead {
+        worker_id: u32,
+        request_id: u64,
+        session_id: u64,
+    },
+    /// Host execution write request.
+    HostExecWrite {
+        worker_id: u32,
+        request_id: u64,
+        session_id: u64,
+        data: Vec<u8>,
+    },
+    /// Host execution close stdin request.
+    HostExecCloseStdin {
+        worker_id: u32,
+        request_id: u64,
+        session_id: u64,
+    },
+    /// Internal message: host_exec read completed (async Promise resolved).
+    HostExecReadComplete {
+        worker_id: u32,
+        request_id: u64,
+        msg_type: u32,
+        data: Vec<u8>,
+    },
     /// Tell all workers to cache a WebAssembly module.
     #[allow(dead_code)]
     CacheModule {
@@ -124,6 +159,50 @@ impl SchedulerMessage {
                     spawn_wasm,
                 })
             }
+            consts::TYPE_HOST_EXEC_START => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let request_array: Uint8Array = de.js(consts::REQUEST_JSON)?;
+                let request_json = request_array.to_vec();
+                Ok(SchedulerMessage::HostExecStart {
+                    worker_id,
+                    request_id,
+                    request_json,
+                })
+            }
+            consts::TYPE_HOST_EXEC_READ => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let session_id = de.serde(consts::SESSION_ID)?;
+                Ok(SchedulerMessage::HostExecRead {
+                    worker_id,
+                    request_id,
+                    session_id,
+                })
+            }
+            consts::TYPE_HOST_EXEC_WRITE => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let session_id = de.serde(consts::SESSION_ID)?;
+                let data_array: Uint8Array = de.js(consts::DATA)?;
+                let data = data_array.to_vec();
+                Ok(SchedulerMessage::HostExecWrite {
+                    worker_id,
+                    request_id,
+                    session_id,
+                    data,
+                })
+            }
+            consts::TYPE_HOST_EXEC_CLOSE_STDIN => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let session_id = de.serde(consts::SESSION_ID)?;
+                Ok(SchedulerMessage::HostExecCloseStdin {
+                    worker_id,
+                    request_id,
+                    session_id,
+                })
+            }
             other => {
                 tracing::warn!(r#type = other, "Unknown message type");
                 Err(anyhow::anyhow!("Unknown message type, \"{other}\"").into())
@@ -175,6 +254,54 @@ impl SchedulerMessage {
                 ser.finish()
             }
             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
+            SchedulerMessage::HostExecStart {
+                worker_id,
+                request_id,
+                request_json,
+            } => {
+                let request_array = Uint8Array::from(request_json.as_slice());
+                Serializer::new(consts::TYPE_HOST_EXEC_START)
+                    .set(consts::WORKER_ID, worker_id)
+                    .set(consts::REQUEST_ID, request_id)
+                    .set(consts::REQUEST_JSON, request_array)
+                    .finish()
+            }
+            SchedulerMessage::HostExecRead {
+                worker_id,
+                request_id,
+                session_id,
+            } => Serializer::new(consts::TYPE_HOST_EXEC_READ)
+                .set(consts::WORKER_ID, worker_id)
+                .set(consts::REQUEST_ID, request_id)
+                .set(consts::SESSION_ID, session_id)
+                .finish(),
+            SchedulerMessage::HostExecWrite {
+                worker_id,
+                request_id,
+                session_id,
+                data,
+            } => {
+                let data_array = Uint8Array::from(data.as_slice());
+                Serializer::new(consts::TYPE_HOST_EXEC_WRITE)
+                    .set(consts::WORKER_ID, worker_id)
+                    .set(consts::REQUEST_ID, request_id)
+                    .set(consts::SESSION_ID, session_id)
+                    .set(consts::DATA, data_array)
+                    .finish()
+            }
+            SchedulerMessage::HostExecCloseStdin {
+                worker_id,
+                request_id,
+                session_id,
+            } => Serializer::new(consts::TYPE_HOST_EXEC_CLOSE_STDIN)
+                .set(consts::WORKER_ID, worker_id)
+                .set(consts::REQUEST_ID, request_id)
+                .set(consts::SESSION_ID, session_id)
+                .finish(),
+            // HostExecReadComplete is an internal message only sent via mpsc channel, never serialized
+            SchedulerMessage::HostExecReadComplete { .. } => {
+                unreachable!("HostExecReadComplete should not be serialized")
+            }
         }
     }
 }
@@ -188,9 +315,17 @@ mod consts {
     pub const TYPE_CACHE_MODULE: &str = "cache-module";
     pub const TYPE_SPAWN_WITH_MODULE: &str = "spawn-with-module";
     pub const TYPE_SPAWN_WITH_MODULE_AND_MEMORY: &str = "spawn-with-module-and-memory";
+    pub const TYPE_HOST_EXEC_START: &str = "host-exec-start";
+    pub const TYPE_HOST_EXEC_READ: &str = "host-exec-read";
+    pub const TYPE_HOST_EXEC_WRITE: &str = "host-exec-write";
+    pub const TYPE_HOST_EXEC_CLOSE_STDIN: &str = "host-exec-close-stdin";
     pub const MEMORY: &str = "memory";
     pub const MODULE_HASH: &str = "module-hash";
     pub const MODULE: &str = "module";
     pub const PTR: &str = "ptr";
     pub const WORKER_ID: &str = "worker-id";
+    pub const REQUEST_ID: &str = "request-id";
+    pub const REQUEST_JSON: &str = "request-json";
+    pub const SESSION_ID: &str = "session-id";
+    pub const DATA: &str = "data";
 }

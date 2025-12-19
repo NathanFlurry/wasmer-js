@@ -33,11 +33,11 @@
 
 mod interop;
 mod post_message_payload;
-mod scheduler;
+pub(crate) mod scheduler;
 mod scheduler_message;
 mod task_wasm;
 mod thread_pool;
-mod thread_pool_worker;
+pub(crate) mod thread_pool_worker;
 mod worker_handle;
 mod worker_message;
 

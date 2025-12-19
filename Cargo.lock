@@ -3478,6 +3478,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde-wasm-bindgen 0.6.3",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

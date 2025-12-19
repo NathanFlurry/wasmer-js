@@ -1,5 +1,5 @@
 use derivative::Derivative;
-use js_sys::WebAssembly;
+use js_sys::{Uint8Array, WebAssembly};
 use wasm_bindgen::JsValue;
 use wasmer_types::ModuleHash;
 
@@ -14,6 +14,18 @@ pub(crate) enum PostMessagePayload {
     Async(AsyncJob),
     Blocking(BlockingJob),
     Notification(Notification),
+    /// Response to a host_exec_start request.
+    HostExecStartResponse {
+        request_id: u64,
+        /// Ok(session_id) or Err(error_message)
+        result: Result<u64, String>,
+    },
+    /// Response to a host_exec_read request.
+    HostExecReadResponse {
+        request_id: u64,
+        /// (msg_type, data) or error
+        result: Result<(u32, Vec<u8>), String>,
+    },
 }
 
 impl PostMessagePayload {
@@ -61,10 +73,17 @@ mod consts {
     pub(crate) const TYPE_CACHE_MODULE: &str = "cache-module";
     pub(crate) const TYPE_SPAWN_WITH_MODULE: &str = "spawn-with-module";
     pub(crate) const TYPE_SPAWN_WITH_MODULE_AND_MEMORY: &str = "spawn-with-module-and-memory";
+    pub(crate) const TYPE_HOST_EXEC_START_RESPONSE: &str = "host-exec-start-response";
+    pub(crate) const TYPE_HOST_EXEC_READ_RESPONSE: &str = "host-exec-read-response";
     pub(crate) const PTR: &str = "ptr";
     pub(crate) const MODULE: &str = "module";
     pub(crate) const MEMORY: &str = "memory";
     pub(crate) const MODULE_HASH: &str = "module-hash";
+    pub(crate) const REQUEST_ID: &str = "request-id";
+    pub(crate) const SESSION_ID: &str = "session-id";
+    pub(crate) const ERROR: &str = "error";
+    pub(crate) const MSG_TYPE: &str = "msg-type";
+    pub(crate) const DATA: &str = "data";
 }
 
 impl PostMessagePayload {
@@ -100,6 +119,28 @@ impl PostMessagePayload {
                     .set(consts::MODULE_HASH, hash.to_string())
                     .set(consts::MODULE, module)
                     .finish()
+            }
+            PostMessagePayload::HostExecStartResponse { request_id, result } => {
+                let mut ser = Serializer::new(consts::TYPE_HOST_EXEC_START_RESPONSE)
+                    .set(consts::REQUEST_ID, request_id);
+                match result {
+                    Ok(session_id) => ser = ser.set(consts::SESSION_ID, session_id),
+                    Err(error) => ser = ser.set(consts::ERROR, error),
+                }
+                ser.finish()
+            }
+            PostMessagePayload::HostExecReadResponse { request_id, result } => {
+                let mut ser = Serializer::new(consts::TYPE_HOST_EXEC_READ_RESPONSE)
+                    .set(consts::REQUEST_ID, request_id);
+                match result {
+                    Ok((msg_type, data)) => {
+                        let data_array = Uint8Array::from(data.as_slice());
+                        ser = ser.set(consts::MSG_TYPE, msg_type);
+                        ser = ser.set(consts::DATA, data_array);
+                    }
+                    Err(error) => ser = ser.set(consts::ERROR, error),
+                }
+                ser.finish()
             }
         }
     }
@@ -157,6 +198,28 @@ impl PostMessagePayload {
                         spawn_wasm,
                     },
                 ))
+            }
+            consts::TYPE_HOST_EXEC_START_RESPONSE => {
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let result = if let Ok(session_id) = de.serde::<u64>(consts::SESSION_ID) {
+                    Ok(session_id)
+                } else {
+                    let error: String = de.serde(consts::ERROR)?;
+                    Err(error)
+                };
+                Ok(PostMessagePayload::HostExecStartResponse { request_id, result })
+            }
+            consts::TYPE_HOST_EXEC_READ_RESPONSE => {
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let result = if let Ok(msg_type) = de.serde::<u32>(consts::MSG_TYPE) {
+                    let data_array: Uint8Array = de.js(consts::DATA)?;
+                    let data = data_array.to_vec();
+                    Ok((msg_type, data))
+                } else {
+                    let error: String = de.serde(consts::ERROR)?;
+                    Err(error)
+                };
+                Ok(PostMessagePayload::HostExecReadResponse { request_id, result })
             }
             other => Err(anyhow::anyhow!("Unknown message type: {other}").into()),
         }
