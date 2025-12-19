@@ -523,6 +523,150 @@ impl HostExecRuntime for HostExecImpl {
         // Return success immediately
         Box::pin(async move { Ok(()) })
     }
+
+    fn host_exec_try_read(
+        &self,
+        session: HostExecSession,
+    ) -> BoxFuture<'_, Result<Option<HostExecOutput>, anyhow::Error>> {
+        // Get current worker ID
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
+            None => {
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_try_read called outside of worker thread"))
+                });
+            }
+        };
+
+        let request_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+
+        // Send poll request to scheduler via postMessage
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecTryRead {
+            worker_id,
+            request_id,
+            session_id: session,
+        });
+
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec_try_read: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
+        }
+
+        // Block using Atomics.wait() until the main thread writes the response
+        Box::pin(async move {
+            HOST_EXEC_INT32_VIEW.with(|view_cell| {
+                let view_opt = view_cell.borrow();
+                let view = view_opt.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("host_exec buffer not initialized"))?;
+
+                // Reset status to 0 (waiting) before blocking
+                Atomics::store(view, 0, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Block until status becomes non-zero (response ready)
+                let wait_result = Atomics::wait(view, 0, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::wait failed: {:?}", e))?;
+
+                web_sys::console::warn_1(&format!("[worker] host_exec_try_read wait returned: {:?}", wait_result).into());
+
+                // Read the response from the buffer
+                // Status: 0 = waiting, 1 = data available, 2 = no data (EAGAIN)
+                let status = Atomics::load(view, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))?;
+
+                if status == 2 {
+                    // No data available
+                    return Ok(None);
+                }
+
+                let msg_type = Atomics::load(view, 1)
+                    .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))? as u32;
+                let data_len_or_exit_code = Atomics::load(view, 2)
+                    .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))?;
+
+                // Convert to HostExecOutput based on msg_type
+                match msg_type {
+                    3 => {
+                        // MSG_TYPE_EXIT
+                        Ok(Some(HostExecOutput::Exit(data_len_or_exit_code)))
+                    }
+                    1 | 2 => {
+                        // MSG_TYPE_STDOUT or MSG_TYPE_STDERR
+                        let data_len = data_len_or_exit_code as usize;
+                        let mut data = vec![0u8; data_len];
+
+                        // Read data bytes from buffer starting at index 4 (byte offset 16)
+                        let buffer = view.buffer();
+                        let uint8_view = js_sys::Uint8Array::new(&buffer);
+
+                        for i in 0..data_len {
+                            data[i] = uint8_view.get_index((16 + i) as u32) as u8;
+                        }
+
+                        if msg_type == 1 {
+                            Ok(Some(HostExecOutput::Stdout(data)))
+                        } else {
+                            Ok(Some(HostExecOutput::Stderr(data)))
+                        }
+                    }
+                    _ => Err(anyhow::anyhow!("Unknown message type: {}", msg_type)),
+                }
+            })
+        })
+    }
+
+    fn host_exec_poll(
+        &self,
+        session: HostExecSession,
+    ) -> BoxFuture<'_, Result<bool, anyhow::Error>> {
+        // Get current worker ID
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
+            None => {
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_poll called outside of worker thread"))
+                });
+            }
+        };
+
+        let request_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+
+        // Send poll request to scheduler via postMessage
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecPoll {
+            worker_id,
+            request_id,
+            session_id: session,
+        });
+
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec_poll: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
+        }
+
+        // Block using Atomics.wait() until the main thread writes the response
+        Box::pin(async move {
+            HOST_EXEC_INT32_VIEW.with(|view_cell| {
+                let view_opt = view_cell.borrow();
+                let view = view_opt.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("host_exec buffer not initialized"))?;
+
+                // Reset status to 0 (waiting) before blocking
+                Atomics::store(view, 0, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Block until status becomes non-zero (response ready)
+                let _wait_result = Atomics::wait(view, 0, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::wait failed: {:?}", e))?;
+
+                // Read the result from status field: 1 = data available, 2 = no data
+                let status = Atomics::load(view, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))?;
+
+                // Status 1 means ready, status 2 means not ready
+                Ok(status == 1)
+            })
+        })
+    }
 }
 
 /// Create the HostExecContext object for the JS handler.
