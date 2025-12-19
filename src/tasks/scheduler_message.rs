@@ -59,6 +59,18 @@ pub(crate) enum SchedulerMessage {
         request_id: u64,
         session_id: u64,
     },
+    /// Host execution try_read request (non-blocking).
+    HostExecTryRead {
+        worker_id: u32,
+        request_id: u64,
+        session_id: u64,
+    },
+    /// Host execution poll request.
+    HostExecPoll {
+        worker_id: u32,
+        request_id: u64,
+        session_id: u64,
+    },
     /// Internal message: host_exec read completed (async Promise resolved).
     HostExecReadComplete {
         worker_id: u32,
@@ -203,6 +215,26 @@ impl SchedulerMessage {
                     session_id,
                 })
             }
+            consts::TYPE_HOST_EXEC_TRY_READ => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let session_id = de.serde(consts::SESSION_ID)?;
+                Ok(SchedulerMessage::HostExecTryRead {
+                    worker_id,
+                    request_id,
+                    session_id,
+                })
+            }
+            consts::TYPE_HOST_EXEC_POLL => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let session_id = de.serde(consts::SESSION_ID)?;
+                Ok(SchedulerMessage::HostExecPoll {
+                    worker_id,
+                    request_id,
+                    session_id,
+                })
+            }
             other => {
                 tracing::warn!(r#type = other, "Unknown message type");
                 Err(anyhow::anyhow!("Unknown message type, \"{other}\"").into())
@@ -298,6 +330,24 @@ impl SchedulerMessage {
                 .set(consts::REQUEST_ID, request_id)
                 .set(consts::SESSION_ID, session_id)
                 .finish(),
+            SchedulerMessage::HostExecTryRead {
+                worker_id,
+                request_id,
+                session_id,
+            } => Serializer::new(consts::TYPE_HOST_EXEC_TRY_READ)
+                .set(consts::WORKER_ID, worker_id)
+                .set(consts::REQUEST_ID, request_id)
+                .set(consts::SESSION_ID, session_id)
+                .finish(),
+            SchedulerMessage::HostExecPoll {
+                worker_id,
+                request_id,
+                session_id,
+            } => Serializer::new(consts::TYPE_HOST_EXEC_POLL)
+                .set(consts::WORKER_ID, worker_id)
+                .set(consts::REQUEST_ID, request_id)
+                .set(consts::SESSION_ID, session_id)
+                .finish(),
             // HostExecReadComplete is an internal message only sent via mpsc channel, never serialized
             SchedulerMessage::HostExecReadComplete { .. } => {
                 unreachable!("HostExecReadComplete should not be serialized")
@@ -319,6 +369,8 @@ mod consts {
     pub const TYPE_HOST_EXEC_READ: &str = "host-exec-read";
     pub const TYPE_HOST_EXEC_WRITE: &str = "host-exec-write";
     pub const TYPE_HOST_EXEC_CLOSE_STDIN: &str = "host-exec-close-stdin";
+    pub const TYPE_HOST_EXEC_TRY_READ: &str = "host-exec-try-read";
+    pub const TYPE_HOST_EXEC_POLL: &str = "host-exec-poll";
     pub const MEMORY: &str = "memory";
     pub const MODULE_HASH: &str = "module-hash";
     pub const MODULE: &str = "module";

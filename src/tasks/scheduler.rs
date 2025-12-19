@@ -425,6 +425,45 @@ impl SchedulerState {
                 });
                 Ok(())
             }
+            SchedulerMessage::HostExecTryRead { worker_id, request_id: _, session_id } => {
+                web_sys::console::warn_1(&format!("[scheduler] HostExecTryRead worker={} session={}", worker_id, session_id).into());
+
+                // Check for queued output data (non-blocking)
+                let queued_data = OUTPUT_QUEUES.lock().unwrap()
+                    .get_mut(&session_id)
+                    .and_then(|q| q.pop_front());
+
+                if let Some((msg_type, data)) = queued_data {
+                    // Send queued stdout/stderr data (status=1)
+                    web_sys::console::warn_1(&format!("[scheduler] TryRead: sending queued data for session {}: type={} len={}", session_id, msg_type, data.len()).into());
+                    self.send_host_exec_read_response(worker_id, session_id, msg_type, data.len() as i32, Some(&data))
+                } else if let Some(exit_code) = HOST_EXEC_RESULTS.lock().unwrap().remove(&session_id) {
+                    // No more data, but process has exited - send exit code (status=1)
+                    web_sys::console::warn_1(&format!("[scheduler] TryRead: exit ready for session {}: exit_code={}", session_id, exit_code).into());
+                    OUTPUT_QUEUES.lock().unwrap().remove(&session_id);
+                    self.send_host_exec_read_response(worker_id, session_id, MSG_TYPE_EXIT, exit_code, None)
+                } else {
+                    // No data available - send status=2 (EAGAIN)
+                    web_sys::console::warn_1(&format!("[scheduler] TryRead: no data for session {}", session_id).into());
+                    self.send_host_exec_try_read_no_data(worker_id, session_id)
+                }
+            }
+            SchedulerMessage::HostExecPoll { worker_id, request_id: _, session_id } => {
+                web_sys::console::warn_1(&format!("[scheduler] HostExecPoll worker={} session={}", worker_id, session_id).into());
+
+                // Check if there's data available (without consuming it)
+                let has_queued_data = OUTPUT_QUEUES.lock().unwrap()
+                    .get(&session_id)
+                    .map(|q| !q.is_empty())
+                    .unwrap_or(false);
+
+                let has_exit_result = HOST_EXEC_RESULTS.lock().unwrap().contains_key(&session_id);
+
+                let is_ready = has_queued_data || has_exit_result;
+                web_sys::console::warn_1(&format!("[scheduler] Poll: session {} ready={}", session_id, is_ready).into());
+
+                self.send_host_exec_poll_response(worker_id, session_id, is_ready)
+            }
             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
         }
     }
@@ -488,6 +527,65 @@ impl SchedulerState {
                     "[scheduler] Atomics.notify woke {} waiters",
                     notified
                 ).into());
+
+                return Ok(());
+            }
+        }
+        Err(anyhow::anyhow!("Worker {} not found", worker_id))
+    }
+
+    fn send_host_exec_try_read_no_data(&mut self, worker_id: u32, session_id: u64) -> Result<(), Error> {
+        // Send status=2 (EAGAIN) to indicate no data available
+        for worker in self.idle.iter().chain(self.busy.iter()) {
+            if worker.id() == worker_id {
+                let int32_view = worker.host_exec_int32_view();
+
+                // Buffer layout:
+                //   [0]: status flag (0 = waiting, 1 = response ready, 2 = no data / EAGAIN)
+                //   [1]: msg_type (unused for EAGAIN)
+                //   [2]: data_len (unused for EAGAIN)
+                //   [3]: session_id
+
+                // Write session_id
+                Atomics::store(&int32_view, 3, session_id as i32)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Set status to 2 (EAGAIN)
+                Atomics::store(&int32_view, 0, 2)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Wake up the worker
+                Atomics::notify(&int32_view, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::notify failed: {:?}", e))?;
+
+                return Ok(());
+            }
+        }
+        Err(anyhow::anyhow!("Worker {} not found", worker_id))
+    }
+
+    fn send_host_exec_poll_response(&mut self, worker_id: u32, session_id: u64, is_ready: bool) -> Result<(), Error> {
+        // Send poll response using status field
+        for worker in self.idle.iter().chain(self.busy.iter()) {
+            if worker.id() == worker_id {
+                let int32_view = worker.host_exec_int32_view();
+
+                // Buffer layout for poll:
+                //   [0]: status flag (0 = waiting, 1 = ready, 2 = not ready)
+                //   [3]: session_id
+
+                // Write session_id
+                Atomics::store(&int32_view, 3, session_id as i32)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Set status: 1 = ready, 2 = not ready
+                let status = if is_ready { 1 } else { 2 };
+                Atomics::store(&int32_view, 0, status)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Wake up the worker
+                Atomics::notify(&int32_view, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::notify failed: {:?}", e))?;
 
                 return Ok(());
             }
