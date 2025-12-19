@@ -78,6 +78,15 @@ pub(crate) enum SchedulerMessage {
         session_id: u64,
         signal: u32,
     },
+    /// Host execution child output - WASM sends child stdout/stderr/exit to Node.
+    HostExecChildOutput {
+        worker_id: u32,
+        request_id: u64,
+        session_id: u64,
+        child_id: u64,
+        msg_type: u32,  // 20=stdout, 21=stderr, 22=exit
+        data: Vec<u8>,
+    },
     /// Internal message: host_exec read completed (async Promise resolved).
     HostExecReadComplete {
         worker_id: u32,
@@ -254,6 +263,23 @@ impl SchedulerMessage {
                     signal,
                 })
             }
+            consts::TYPE_HOST_EXEC_CHILD_OUTPUT => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let session_id = de.serde(consts::SESSION_ID)?;
+                let child_id = de.serde(consts::CHILD_ID)?;
+                let msg_type = de.serde(consts::MSG_TYPE)?;
+                let data_array: Uint8Array = de.js(consts::DATA)?;
+                let data = data_array.to_vec();
+                Ok(SchedulerMessage::HostExecChildOutput {
+                    worker_id,
+                    request_id,
+                    session_id,
+                    child_id,
+                    msg_type,
+                    data,
+                })
+            }
             other => {
                 tracing::warn!(r#type = other, "Unknown message type");
                 Err(anyhow::anyhow!("Unknown message type, \"{other}\"").into())
@@ -378,6 +404,24 @@ impl SchedulerMessage {
                 .set(consts::SESSION_ID, session_id)
                 .set(consts::SIGNAL, signal)
                 .finish(),
+            SchedulerMessage::HostExecChildOutput {
+                worker_id,
+                request_id,
+                session_id,
+                child_id,
+                msg_type,
+                data,
+            } => {
+                let data_array = Uint8Array::from(data.as_slice());
+                Serializer::new(consts::TYPE_HOST_EXEC_CHILD_OUTPUT)
+                    .set(consts::WORKER_ID, worker_id)
+                    .set(consts::REQUEST_ID, request_id)
+                    .set(consts::SESSION_ID, session_id)
+                    .set(consts::CHILD_ID, child_id)
+                    .set(consts::MSG_TYPE, msg_type)
+                    .set(consts::DATA, data_array)
+                    .finish()
+            }
             // HostExecReadComplete is an internal message only sent via mpsc channel, never serialized
             SchedulerMessage::HostExecReadComplete { .. } => {
                 unreachable!("HostExecReadComplete should not be serialized")
@@ -402,6 +446,7 @@ mod consts {
     pub const TYPE_HOST_EXEC_TRY_READ: &str = "host-exec-try-read";
     pub const TYPE_HOST_EXEC_POLL: &str = "host-exec-poll";
     pub const TYPE_HOST_EXEC_SIGNAL: &str = "host-exec-signal";
+    pub const TYPE_HOST_EXEC_CHILD_OUTPUT: &str = "host-exec-child-output";
     pub const MEMORY: &str = "memory";
     pub const MODULE_HASH: &str = "module-hash";
     pub const MODULE: &str = "module";
@@ -412,4 +457,6 @@ mod consts {
     pub const SESSION_ID: &str = "session-id";
     pub const DATA: &str = "data";
     pub const SIGNAL: &str = "signal";
+    pub const CHILD_ID: &str = "child-id";
+    pub const MSG_TYPE: &str = "msg-type";
 }
