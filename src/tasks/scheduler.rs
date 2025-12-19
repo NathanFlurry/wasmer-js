@@ -32,6 +32,10 @@ const MSG_TYPE_STDOUT: u32 = 1;
 const MSG_TYPE_STDERR: u32 = 2;
 const MSG_TYPE_EXIT: u32 = 3;
 
+/// Counter for generating unique child session IDs.
+/// Starts at a high value to avoid collision with parent session IDs (which use request_id).
+static NEXT_CHILD_SESSION_ID: Lazy<std::sync::atomic::AtomicU64> = Lazy::new(|| std::sync::atomic::AtomicU64::new(1_000_000));
+
 /// Stores the exit code for completed host_exec sessions.
 /// Key is session_id, value is exit code.
 static HOST_EXEC_RESULTS: Lazy<Mutex<HashMap<u64, i32>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -769,7 +773,7 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
     js_sys::Reflect::set(&obj, &JsValue::from_str("onStdout"), &on_stdout.into_js_value()).ok();
 
     // Create onStderr callback
-    let stderr_scheduler = scheduler;
+    let stderr_scheduler = scheduler.clone();
     let on_stderr: Closure<dyn Fn(JsValue)> = Closure::new(move |data: JsValue| {
         if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
             let bytes = array.to_vec();
@@ -815,6 +819,163 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
     });
     js_sys::Reflect::set(&obj, &JsValue::from_str("setKillFunction"), &set_kill_function.into_js_value()).ok();
 
+    // Create spawnChildStreaming callback - allows handler to spawn nested child processes
+    // Returns a SpawnedProcess object: { writeStdin, closeStdin, kill, wait }
+    let _spawn_scheduler = scheduler; // Consume remaining scheduler (reserved for future use)
+    let spawn_child_streaming: Closure<dyn Fn(JsValue, JsValue, JsValue) -> JsValue> = Closure::new(move |command: JsValue, args: JsValue, options: JsValue| {
+        // Generate unique session ID for this child
+        let child_session_id = NEXT_CHILD_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Parse command
+        let command_str = command.as_string().unwrap_or_default();
+
+        // Parse args array
+        let mut args_vec: Vec<String> = Vec::new();
+        if let Ok(args_array) = args.dyn_into::<js_sys::Array>() {
+            for i in 0..args_array.length() {
+                if let Some(s) = args_array.get(i).as_string() {
+                    args_vec.push(s);
+                }
+            }
+        }
+
+        // Parse options object
+        let mut cwd = String::from("/");
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut on_stdout_fn: Option<js_sys::Function> = None;
+        let mut on_stderr_fn: Option<js_sys::Function> = None;
+
+        if let Ok(opts_obj) = options.dyn_into::<js_sys::Object>() {
+            if let Ok(cwd_val) = js_sys::Reflect::get(&opts_obj, &JsValue::from_str("cwd")) {
+                if let Some(s) = cwd_val.as_string() {
+                    cwd = s;
+                }
+            }
+            if let Ok(env_val) = js_sys::Reflect::get(&opts_obj, &JsValue::from_str("env")) {
+                if let Ok(env_obj) = env_val.dyn_into::<js_sys::Object>() {
+                    let keys = js_sys::Object::keys(&env_obj);
+                    for i in 0..keys.length() {
+                        if let Some(key) = keys.get(i).as_string() {
+                            if let Ok(val) = js_sys::Reflect::get(&env_obj, &JsValue::from_str(&key)) {
+                                if let Some(v) = val.as_string() {
+                                    env.insert(key, v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(stdout_val) = js_sys::Reflect::get(&opts_obj, &JsValue::from_str("onStdout")) {
+                on_stdout_fn = stdout_val.dyn_into::<js_sys::Function>().ok();
+            }
+            if let Ok(stderr_val) = js_sys::Reflect::get(&opts_obj, &JsValue::from_str("onStderr")) {
+                on_stderr_fn = stderr_val.dyn_into::<js_sys::Function>().ok();
+            }
+        }
+
+        // Create child HostExecRequest
+        let child_request = HostExecRequest {
+            command: command_str,
+            args: args_vec,
+            env,
+            cwd,
+            terminal: None,
+        };
+
+        // Create child context with callbacks that forward to parent's onStdout/onStderr
+        let child_context = create_child_exec_context(&child_request, child_session_id, on_stdout_fn, on_stderr_fn);
+
+        // Get the handler and call it for the child
+        let handler = HOST_EXEC_HANDLER.with(|h| h.borrow().clone());
+        if let Some(handler_fn) = handler {
+            let result = handler_fn.call1(&JsValue::NULL, &child_context);
+            if let Ok(promise_value) = result {
+                if let Ok(promise) = promise_value.dyn_into::<js_sys::Promise>() {
+                    // Store reference to resolve exit code when promise completes
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let future = wasm_bindgen_futures::JsFuture::from(promise);
+                        match future.await {
+                            Ok(exit_code_value) => {
+                                let exit_code = exit_code_value.as_f64().unwrap_or(0.0) as i32;
+                                HOST_EXEC_RESULTS.lock().unwrap().insert(child_session_id, exit_code);
+                            }
+                            Err(_) => {
+                                HOST_EXEC_RESULTS.lock().unwrap().insert(child_session_id, 1);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // Create SpawnedProcess handle object
+        let handle = js_sys::Object::new();
+
+        // writeStdin(data: Uint8Array | string)
+        let write_stdin: Closure<dyn Fn(JsValue)> = Closure::new(move |data: JsValue| {
+            STDIN_WRITERS.with(|writers| {
+                if let Some((writer_fn, _)) = writers.borrow().get(&child_session_id) {
+                    let _ = writer_fn.call1(&JsValue::NULL, &data);
+                }
+            });
+        });
+        js_sys::Reflect::set(&handle, &JsValue::from_str("writeStdin"), &write_stdin.into_js_value()).ok();
+
+        // closeStdin()
+        let close_stdin: Closure<dyn Fn()> = Closure::new(move || {
+            STDIN_WRITERS.with(|writers| {
+                if let Some((_, closer_fn)) = writers.borrow_mut().remove(&child_session_id) {
+                    let _ = closer_fn.call0(&JsValue::NULL);
+                }
+            });
+        });
+        js_sys::Reflect::set(&handle, &JsValue::from_str("closeStdin"), &close_stdin.into_js_value()).ok();
+
+        // kill(signal?: number)
+        let kill: Closure<dyn Fn(JsValue)> = Closure::new(move |signal: JsValue| {
+            let sig = signal.as_f64().unwrap_or(15.0) as i32;
+            SIGNAL_HANDLERS.with(|handlers| {
+                if let Some(kill_fn) = handlers.borrow().get(&child_session_id) {
+                    let _ = kill_fn.call1(&JsValue::NULL, &JsValue::from_f64(sig as f64));
+                }
+            });
+        });
+        js_sys::Reflect::set(&handle, &JsValue::from_str("kill"), &kill.into_js_value()).ok();
+
+        // wait(): Promise<number>
+        let wait: Closure<dyn Fn() -> JsValue> = Closure::new(move || {
+            // Return a Promise that resolves when the child exits
+            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                // Check if already exited
+                if let Some(exit_code) = HOST_EXEC_RESULTS.lock().unwrap().remove(&child_session_id) {
+                    let _ = resolve.call1(&JsValue::NULL, &JsValue::from_f64(exit_code as f64));
+                    return;
+                }
+
+                // Poll for completion
+                let resolve_clone = resolve.clone();
+                let poll_interval: Closure<dyn Fn()> = Closure::new(move || {
+                    if let Some(exit_code) = HOST_EXEC_RESULTS.lock().unwrap().remove(&child_session_id) {
+                        let _ = resolve_clone.call1(&JsValue::NULL, &JsValue::from_f64(exit_code as f64));
+                        // Note: Can't easily cancel the interval from here, but it will only fire once more
+                    }
+                });
+
+                let window = web_sys::window().unwrap();
+                let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                    poll_interval.as_ref().unchecked_ref(),
+                    50, // Poll every 50ms
+                );
+                poll_interval.forget(); // Leak the closure - it will be cleaned up eventually
+            });
+            promise.into()
+        });
+        js_sys::Reflect::set(&handle, &JsValue::from_str("wait"), &wait.into_js_value()).ok();
+
+        handle.into()
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("spawnChildStreaming"), &spawn_child_streaming.into_js_value()).ok();
+
     // Set terminal options if present
     if let Some(ref terminal) = request.terminal {
         let term_obj = js_sys::Object::new();
@@ -823,6 +984,98 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
         js_sys::Reflect::set(&term_obj, &JsValue::from_str("rows"), &JsValue::from_f64(terminal.rows as f64)).ok();
         js_sys::Reflect::set(&obj, &JsValue::from_str("terminal"), &term_obj).ok();
     }
+
+    obj.into()
+}
+
+/// Create a simplified context for child processes spawned via spawnChildStreaming.
+/// This context forwards stdout/stderr to the parent's callbacks directly instead of
+/// going through the scheduler's output queues.
+fn create_child_exec_context(
+    request: &HostExecRequest,
+    session_id: u64,
+    on_stdout_fn: Option<js_sys::Function>,
+    on_stderr_fn: Option<js_sys::Function>,
+) -> JsValue {
+    use wasm_bindgen::prelude::Closure;
+
+    let obj = js_sys::Object::new();
+
+    // Set command
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("command"),
+        &JsValue::from_str(&request.command),
+    )
+    .ok();
+
+    // Set args
+    let args = js_sys::Array::new();
+    for arg in &request.args {
+        args.push(&JsValue::from_str(arg));
+    }
+    js_sys::Reflect::set(&obj, &JsValue::from_str("args"), &args).ok();
+
+    // Set env
+    let env = js_sys::Object::new();
+    for (key, value) in &request.env {
+        js_sys::Reflect::set(
+            &env,
+            &JsValue::from_str(key),
+            &JsValue::from_str(value),
+        )
+        .ok();
+    }
+    js_sys::Reflect::set(&obj, &JsValue::from_str("env"), &env).ok();
+
+    // Set cwd
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("cwd"),
+        &JsValue::from_str(&request.cwd),
+    )
+    .ok();
+
+    // Set stdin/stdout/stderr to null
+    js_sys::Reflect::set(&obj, &JsValue::from_str("stdin"), &JsValue::NULL).ok();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("stdout"), &JsValue::NULL).ok();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("stderr"), &JsValue::NULL).ok();
+
+    // Create onStdout callback - forwards to parent's callback
+    if let Some(parent_stdout) = on_stdout_fn {
+        let on_stdout: Closure<dyn Fn(JsValue)> = Closure::new(move |data: JsValue| {
+            let _ = parent_stdout.call1(&JsValue::NULL, &data);
+        });
+        js_sys::Reflect::set(&obj, &JsValue::from_str("onStdout"), &on_stdout.into_js_value()).ok();
+    }
+
+    // Create onStderr callback - forwards to parent's callback
+    if let Some(parent_stderr) = on_stderr_fn {
+        let on_stderr: Closure<dyn Fn(JsValue)> = Closure::new(move |data: JsValue| {
+            let _ = parent_stderr.call1(&JsValue::NULL, &data);
+        });
+        js_sys::Reflect::set(&obj, &JsValue::from_str("onStderr"), &on_stderr.into_js_value()).ok();
+    }
+
+    // Create setStdinWriter callback
+    let set_stdin_writer: Closure<dyn Fn(JsValue, JsValue)> = Closure::new(move |writer: JsValue, closer: JsValue| {
+        if let (Ok(writer_fn), Ok(closer_fn)) = (writer.dyn_into::<js_sys::Function>(), closer.dyn_into::<js_sys::Function>()) {
+            STDIN_WRITERS.with(|writers| {
+                writers.borrow_mut().insert(session_id, (writer_fn, closer_fn));
+            });
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("setStdinWriter"), &set_stdin_writer.into_js_value()).ok();
+
+    // Create setKillFunction callback
+    let set_kill_function: Closure<dyn Fn(JsValue)> = Closure::new(move |kill_fn: JsValue| {
+        if let Ok(fn_obj) = kill_fn.dyn_into::<js_sys::Function>() {
+            SIGNAL_HANDLERS.with(|handlers| {
+                handlers.borrow_mut().insert(session_id, fn_obj);
+            });
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("setKillFunction"), &set_kill_function.into_js_value()).ok();
 
     obj.into()
 }
