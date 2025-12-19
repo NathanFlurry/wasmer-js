@@ -690,6 +690,44 @@ impl HostExecRuntime for HostExecImpl {
         // Return success immediately - signal is fire-and-forget
         Box::pin(async move { Ok(()) })
     }
+
+    fn host_exec_child_output(
+        &self,
+        session: HostExecSession,
+        child_id: u64,
+        msg_type: u32,
+        data: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        // Get current worker ID
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
+            None => {
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_child_output called outside of worker thread"))
+                });
+            }
+        };
+
+        let request_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+
+        // Send child output to scheduler via postMessage
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecChildOutput {
+            worker_id,
+            request_id,
+            session_id: session,
+            child_id,
+            msg_type,
+            data,
+        });
+
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec_child_output: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
+        }
+
+        // Return success immediately - child output is fire-and-forget
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 /// A [`Source`] that will always error out with [`QueryError::Unsupported`].
