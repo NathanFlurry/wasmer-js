@@ -1,20 +1,38 @@
 use std::fmt::Debug;
 
 use anyhow::{Context, Error};
-use js_sys::{Array, JsString, Uint8Array};
+use js_sys::{Array, Int32Array, JsString, SharedArrayBuffer, Uint8Array};
 use once_cell::sync::Lazy;
 use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 
 use crate::tasks::{PostMessagePayload, Scheduler, SchedulerMessage, WorkerMessage};
 
+/// Size of the SharedArrayBuffer for host_exec communication.
+/// Layout:
+///   [0]: status flag (0 = waiting, 1 = response ready)
+///   [4-7]: msg_type (1 = stdout, 2 = stderr, 3 = exit)
+///   [8-11]: data_len or exit_code
+///   [12-15]: session_id (to verify response matches request)
+///   [16+]: data bytes (up to ~64KB)
+pub(crate) const HOST_EXEC_BUFFER_SIZE: u32 = 65536;
+
 /// A handle to a running [`web_sys::Worker`].
 ///
 /// This provides a structured way to communicate with the worker and will
 /// automatically call [`web_sys::Worker::terminate()`] when dropped.
-#[derive(Debug)]
 pub(crate) struct WorkerHandle {
     id: u32,
     inner: web_sys::Worker,
+    /// SharedArrayBuffer for host_exec IPC with this worker.
+    host_exec_buffer: SharedArrayBuffer,
+}
+
+impl Debug for WorkerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerHandle")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkerHandle {
@@ -44,21 +62,35 @@ impl WorkerHandle {
         let on_error: js_sys::Function = on_error.into_js_value().unchecked_into();
         worker.set_onerror(Some(&on_error));
 
+        // Create SharedArrayBuffer for host_exec IPC
+        let host_exec_buffer = SharedArrayBuffer::new(HOST_EXEC_BUFFER_SIZE);
+
         // The worker has technically been started, but it's kinda useless
         // because it hasn't been initialized with the same WebAssembly module
         // and linear memory as the scheduler. We need to initialize explicitly.
-        init_message(worker_id)
+        init_message(worker_id, &host_exec_buffer)
             .and_then(|msg| worker.post_message(&msg))
             .map_err(crate::utils::js_error)?;
 
         Ok(WorkerHandle {
             id: worker_id,
             inner: worker,
+            host_exec_buffer,
         })
     }
 
     pub(crate) fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Get the SharedArrayBuffer for host_exec IPC with this worker.
+    pub(crate) fn host_exec_buffer(&self) -> &SharedArrayBuffer {
+        &self.host_exec_buffer
+    }
+
+    /// Get an Int32Array view of the host_exec buffer for atomic operations.
+    pub(crate) fn host_exec_int32_view(&self) -> Int32Array {
+        Int32Array::new(&self.host_exec_buffer)
     }
 
     /// Send a message to the worker.
@@ -131,7 +163,7 @@ impl Drop for WorkerHandle {
 }
 
 /// Craft the special `"init"` message.
-fn init_message(id: u32) -> Result<JsValue, JsValue> {
+fn init_message(id: u32, host_exec_buffer: &SharedArrayBuffer) -> Result<JsValue, JsValue> {
     let msg = js_sys::Object::new();
 
     js_sys::Reflect::set(&msg, &JsString::from("type"), &JsString::from("init"))?;
@@ -142,6 +174,12 @@ fn init_message(id: u32) -> Result<JsValue, JsValue> {
         &msg,
         &JsString::from("module"),
         &crate::utils::current_module(),
+    )?;
+    // Pass the SharedArrayBuffer for host_exec IPC
+    js_sys::Reflect::set(
+        &msg,
+        &JsString::from("hostExecBuffer"),
+        host_exec_buffer,
     )?;
 
     Ok(msg.into())

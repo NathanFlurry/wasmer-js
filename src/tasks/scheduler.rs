@@ -1,21 +1,48 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{atomic::{AtomicU32, Ordering}, Mutex},
 };
 
 use anyhow::{Context, Error};
+use js_sys::{Atomics, Int32Array, Uint8Array};
+use once_cell::sync::Lazy;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::{self};
 use tracing::Instrument;
 use wasm_bindgen::{JsCast, JsValue};
 use wasmer::js::AsJs;
+use wasmer_wasix::runtime::HostExecRequest;
 use wasmer_types::ModuleHash;
+use serde_json;
 
 use crate::tasks::{
     AsyncJob, BlockingJob, Notification, PostMessagePayload, SchedulerMessage, WorkerHandle,
     WorkerMessage,
 };
+
+// Thread-local storage for the host_exec handler (JS function cannot be Send+Sync)
+// This is accessed from the main thread where the scheduler runs.
+thread_local! {
+    pub(crate) static HOST_EXEC_HANDLER: std::cell::RefCell<Option<js_sys::Function>> = std::cell::RefCell::new(None);
+}
+
+/// Message type constants for host_exec_read responses.
+const MSG_TYPE_STDOUT: u32 = 1;
+const MSG_TYPE_STDERR: u32 = 2;
+const MSG_TYPE_EXIT: u32 = 3;
+
+/// Stores the exit code for completed host_exec sessions.
+/// Key is session_id, value is exit code.
+static HOST_EXEC_RESULTS: Lazy<Mutex<HashMap<u64, i32>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Stores pending read requests waiting for session results.
+/// Key is session_id, value is (worker_id, request_id).
+static PENDING_READS: Lazy<Mutex<HashMap<u64, (u32, u64)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Stores output queues for streaming stdout/stderr.
+/// Key is session_id, value is queue of (msg_type, data).
+static OUTPUT_QUEUES: Lazy<Mutex<HashMap<u64, VecDeque<(u32, Vec<u8>)>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// A handle for interacting with the threadpool's scheduler.
 #[derive(Debug, Clone)]
@@ -219,8 +246,239 @@ impl SchedulerState {
                 );
                 Ok(())
             }
+            SchedulerMessage::HostExecStart { worker_id, request_id, request_json } => {
+                tracing::debug!(worker_id, request_id, "Received host_exec_start request");
+
+                // Parse the request
+                let request: HostExecRequest = match serde_json::from_slice(&request_json) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let error = format!("Failed to parse request: {}", e);
+                        return self.send_host_exec_start_response(worker_id, request_id, Err(error));
+                    }
+                };
+
+                // Get the handler from thread-local
+                let handler = HOST_EXEC_HANDLER.with(|h| h.borrow().clone());
+                let handler = match handler {
+                    Some(h) => h,
+                    None => {
+                        let error = "host_exec handler not registered".to_string();
+                        return self.send_host_exec_start_response(worker_id, request_id, Err(error));
+                    }
+                };
+
+                // Use request_id as session_id
+                let session_id = request_id;
+
+                // Create the context object for JS with streaming callbacks
+                let context = create_host_exec_context(&request, session_id, self.mailbox.clone());
+
+                // Call the JS handler
+                let this = JsValue::NULL;
+                let result = handler.call1(&this, &context);
+
+                match result {
+                    Ok(promise_value) => {
+                        // The handler returned a Promise, convert and spawn async task
+                        tracing::debug!(request_id, session_id, "Handler called successfully, spawning async task");
+
+                        // Convert JsValue to Promise and spawn async task to await it
+                        let promise: js_sys::Promise = match promise_value.dyn_into() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                let error = "Handler did not return a Promise".to_string();
+                                return self.send_host_exec_start_response(worker_id, request_id, Err(error));
+                            }
+                        };
+
+                        let mailbox = self.mailbox.clone();
+                        web_sys::console::warn_1(&format!("[scheduler] spawning async task for session {}", session_id).into());
+                        wasm_bindgen_futures::spawn_local(async move {
+                            web_sys::console::warn_1(&format!("[scheduler] async task started for session {}", session_id).into());
+                            let future = wasm_bindgen_futures::JsFuture::from(promise);
+                            match future.await {
+                                Ok(exit_code_value) => {
+                                    let exit_code = exit_code_value.as_f64().unwrap_or(0.0) as i32;
+                                    web_sys::console::warn_1(&format!("[scheduler] Promise resolved with exit_code={} for session {}", exit_code, session_id).into());
+
+                                    // Store the result
+                                    HOST_EXEC_RESULTS.lock().unwrap().insert(session_id, exit_code);
+
+                                    // Check if there's a pending read request for this session
+                                    let pending = PENDING_READS.lock().unwrap().remove(&session_id);
+                                    web_sys::console::warn_1(&format!("[scheduler] pending read for session {}: {:?}", session_id, pending).into());
+                                    if let Some((read_worker_id, read_session_id)) = pending {
+                                        // Send the exit code to the waiting worker via SchedulerMessage
+                                        // (will be handled by execute() which has access to workers)
+                                        let exit_data = exit_code.to_le_bytes().to_vec();
+                                        let msg = SchedulerMessage::HostExecReadComplete {
+                                            worker_id: read_worker_id,
+                                            request_id: read_session_id,  // Pass session_id through request_id
+                                            msg_type: MSG_TYPE_EXIT,
+                                            data: exit_data,
+                                        };
+                                        if let Err(e) = mailbox.send(msg) {
+                                            web_sys::console::error_1(&format!("[scheduler] Failed to send read complete: {}", e).into());
+                                        } else {
+                                            web_sys::console::warn_1(&"[scheduler] sent HostExecReadComplete".into());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    web_sys::console::warn_1(&format!("[scheduler] Promise rejected for session {}: {:?}", session_id, e).into());
+                                    // Store error as exit code 1
+                                    HOST_EXEC_RESULTS.lock().unwrap().insert(session_id, 1);
+
+                                    // Check if there's a pending read request
+                                    if let Some((read_worker_id, read_session_id)) = PENDING_READS.lock().unwrap().remove(&session_id) {
+                                        let exit_data = 1i32.to_le_bytes().to_vec();
+                                        let msg = SchedulerMessage::HostExecReadComplete {
+                                            worker_id: read_worker_id,
+                                            request_id: read_session_id,  // Pass session_id through request_id
+                                            msg_type: MSG_TYPE_EXIT,
+                                            data: exit_data,
+                                        };
+                                        let _ = mailbox.send(msg);
+                                    }
+                                }
+                            }
+                        });
+
+                        // Return session_id immediately
+                        self.send_host_exec_start_response(worker_id, request_id, Ok(session_id))
+                    }
+                    Err(e) => {
+                        let error = format!("Handler failed: {:?}", e);
+                        self.send_host_exec_start_response(worker_id, request_id, Err(error))
+                    }
+                }
+            }
+            SchedulerMessage::HostExecRead { worker_id, request_id: _, session_id } => {
+                web_sys::console::warn_1(&format!("[scheduler] HostExecRead worker={} session={}", worker_id, session_id).into());
+
+                // First check if there's queued output data
+                let queued_data = OUTPUT_QUEUES.lock().unwrap()
+                    .get_mut(&session_id)
+                    .and_then(|q| q.pop_front());
+
+                if let Some((msg_type, data)) = queued_data {
+                    // Send queued stdout/stderr data
+                    web_sys::console::warn_1(&format!("[scheduler] Sending queued data for session {}: type={} len={}", session_id, msg_type, data.len()).into());
+                    self.send_host_exec_read_response(worker_id, session_id, msg_type, data.len() as i32, Some(&data))
+                } else if let Some(exit_code) = HOST_EXEC_RESULTS.lock().unwrap().remove(&session_id) {
+                    // No more data, but process has exited - send exit code
+                    web_sys::console::warn_1(&format!("[scheduler] Result ready for session {}: exit_code={}", session_id, exit_code).into());
+                    // Clean up output queue
+                    OUTPUT_QUEUES.lock().unwrap().remove(&session_id);
+                    self.send_host_exec_read_response(worker_id, session_id, MSG_TYPE_EXIT, exit_code, None)
+                } else {
+                    // No data yet and process still running - store pending read request
+                    web_sys::console::warn_1(&format!("[scheduler] Storing pending read for session {}", session_id).into());
+                    PENDING_READS.lock().unwrap().insert(session_id, (worker_id, session_id));
+                    Ok(())
+                }
+            }
+            SchedulerMessage::HostExecReadComplete { worker_id, request_id: session_id, msg_type, data } => {
+                // This is sent when an async Promise completes and a read was pending
+                // request_id actually contains the session_id
+                web_sys::console::warn_1(&format!("[scheduler] HostExecReadComplete worker={} session={} msg_type={}", worker_id, session_id, msg_type).into());
+                // For exit, data contains the exit code as bytes; for stdout/stderr it's the data
+                if msg_type == MSG_TYPE_EXIT && data.len() >= 4 {
+                    let exit_code = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    self.send_host_exec_read_response(worker_id, session_id, MSG_TYPE_EXIT, exit_code, None)
+                } else {
+                    self.send_host_exec_read_response(worker_id, session_id, msg_type, data.len() as i32, Some(&data))
+                }
+            }
+            SchedulerMessage::HostExecWrite { worker_id, request_id, session_id, data } => {
+                tracing::debug!(worker_id, request_id, session_id, data_len = data.len(), "Received host_exec_write request");
+                // TODO: Implement
+                Ok(())
+            }
+            SchedulerMessage::HostExecCloseStdin { worker_id, request_id, session_id } => {
+                tracing::debug!(worker_id, request_id, session_id, "Received host_exec_close_stdin request");
+                // TODO: Implement
+                Ok(())
+            }
             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
         }
+    }
+
+    fn send_host_exec_start_response(&mut self, worker_id: u32, request_id: u64, result: Result<u64, String>) -> Result<(), Error> {
+        web_sys::console::warn_1(&format!("[scheduler] send_host_exec_start_response worker={} request={} result={:?}", worker_id, request_id, result).into());
+        let msg = PostMessagePayload::HostExecStartResponse { request_id, result };
+        let res = self.send_to_worker(worker_id, msg);
+        web_sys::console::warn_1(&format!("[scheduler] send_to_worker result: {:?}", res.as_ref().map(|_| "ok").map_err(|e| e.to_string())).into());
+        res
+    }
+
+    fn send_host_exec_read_response(&mut self, worker_id: u32, session_id: u64, msg_type: u32, data_or_exit_code: i32, data: Option<&[u8]>) -> Result<(), Error> {
+        // Find the worker's SharedArrayBuffer
+        for worker in self.idle.iter().chain(self.busy.iter()) {
+            if worker.id() == worker_id {
+                let int32_view = worker.host_exec_int32_view();
+
+                // Buffer layout (Int32Array indices):
+                //   [0]: status flag (0 = waiting, 1 = response ready)
+                //   [1]: msg_type (1 = stdout, 2 = stderr, 3 = exit)
+                //   [2]: data_len or exit_code
+                //   [3]: session_id (for verification)
+                //   [4+]: data bytes (if any)
+
+                // Write msg_type
+                Atomics::store(&int32_view, 1, msg_type as i32)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Write data_len or exit_code
+                Atomics::store(&int32_view, 2, data_or_exit_code)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Write session_id (lower 32 bits for now)
+                Atomics::store(&int32_view, 3, session_id as i32)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Write data bytes if present (starting at byte offset 16)
+                if let Some(data) = data {
+                    let buffer = int32_view.buffer();
+                    let uint8_view = js_sys::Uint8Array::new(&buffer);
+                    for (i, byte) in data.iter().enumerate() {
+                        uint8_view.set_index((16 + i) as u32, *byte);
+                    }
+                }
+
+                // Set status to 1 (response ready) - this must be done AFTER writing all data
+                Atomics::store(&int32_view, 0, 1)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                // Wake up the worker
+                web_sys::console::warn_1(&format!(
+                    "[scheduler] calling Atomics.notify for worker {} session {}",
+                    worker_id, session_id
+                ).into());
+
+                let notified = Atomics::notify(&int32_view, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::notify failed: {:?}", e))?;
+
+                web_sys::console::warn_1(&format!(
+                    "[scheduler] Atomics.notify woke {} waiters",
+                    notified
+                ).into());
+
+                return Ok(());
+            }
+        }
+        Err(anyhow::anyhow!("Worker {} not found", worker_id))
+    }
+
+    fn send_to_worker(&mut self, worker_id: u32, msg: PostMessagePayload) -> Result<(), Error> {
+        // Find the worker in either idle or busy queue
+        for worker in self.idle.iter().chain(self.busy.iter()) {
+            if worker.id() == worker_id {
+                return worker.send(msg);
+            }
+        }
+        Err(anyhow::anyhow!("Worker {} not found", worker_id))
     }
 
     /// Send a task to one of the worker threads, preferring workers that aren't
@@ -291,6 +549,111 @@ fn move_worker(worker_id: u32, from: &mut VecDeque<WorkerHandle>, to: &mut VecDe
         let worker = from.remove(ix).unwrap();
         to.push_back(worker);
     }
+}
+
+/// Create the HostExecContext object for the JS handler.
+/// Includes onStdout and onStderr callbacks for streaming output.
+fn create_host_exec_context(request: &HostExecRequest, session_id: u64, scheduler: Scheduler) -> JsValue {
+    use wasm_bindgen::prelude::Closure;
+
+    // Create a JS object with the context
+    let obj = js_sys::Object::new();
+
+    // Set command
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("command"),
+        &JsValue::from_str(&request.command),
+    )
+    .ok();
+
+    // Set args
+    let args = js_sys::Array::new();
+    for arg in &request.args {
+        args.push(&JsValue::from_str(arg));
+    }
+    js_sys::Reflect::set(&obj, &JsValue::from_str("args"), &args).ok();
+
+    // Set env
+    let env = js_sys::Object::new();
+    for (key, value) in &request.env {
+        js_sys::Reflect::set(
+            &env,
+            &JsValue::from_str(key),
+            &JsValue::from_str(value),
+        )
+        .ok();
+    }
+    js_sys::Reflect::set(&obj, &JsValue::from_str("env"), &env).ok();
+
+    // Set cwd
+    js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("cwd"),
+        &JsValue::from_str(&request.cwd),
+    )
+    .ok();
+
+    // Set stdin to null for now
+    js_sys::Reflect::set(&obj, &JsValue::from_str("stdin"), &JsValue::NULL).ok();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("stdout"), &JsValue::NULL).ok();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("stderr"), &JsValue::NULL).ok();
+
+    // Create onStdout callback
+    let stdout_scheduler = scheduler.clone();
+    let on_stdout: Closure<dyn Fn(JsValue)> = Closure::new(move |data: JsValue| {
+        if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
+            let bytes = array.to_vec();
+
+            // Check if there's a pending read request - if so, send immediately
+            if let Some((worker_id, req_session_id)) = PENDING_READS.lock().unwrap().remove(&session_id) {
+                // Send via message to trigger response (will be handled by execute())
+                let msg = SchedulerMessage::HostExecReadComplete {
+                    worker_id,
+                    request_id: req_session_id,
+                    msg_type: MSG_TYPE_STDOUT,
+                    data: bytes,
+                };
+                let _ = stdout_scheduler.send(msg);
+            } else {
+                // No pending read, queue the data for later
+                OUTPUT_QUEUES.lock().unwrap()
+                    .entry(session_id)
+                    .or_default()
+                    .push_back((MSG_TYPE_STDOUT, bytes));
+            }
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("onStdout"), &on_stdout.into_js_value()).ok();
+
+    // Create onStderr callback
+    let stderr_scheduler = scheduler;
+    let on_stderr: Closure<dyn Fn(JsValue)> = Closure::new(move |data: JsValue| {
+        if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
+            let bytes = array.to_vec();
+
+            // Check if there's a pending read request - if so, send immediately
+            if let Some((worker_id, req_session_id)) = PENDING_READS.lock().unwrap().remove(&session_id) {
+                // Send via message to trigger response
+                let msg = SchedulerMessage::HostExecReadComplete {
+                    worker_id,
+                    request_id: req_session_id,
+                    msg_type: MSG_TYPE_STDERR,
+                    data: bytes,
+                };
+                let _ = stderr_scheduler.send(msg);
+            } else {
+                // No pending read, queue the data for later
+                OUTPUT_QUEUES.lock().unwrap()
+                    .entry(session_id)
+                    .or_default()
+                    .push_back((MSG_TYPE_STDERR, bytes));
+            }
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("onStderr"), &on_stderr.into_js_value()).ok();
+
+    obj.into()
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::future::BoxFuture;
+use js_sys::Atomics;
 use lazy_static::lazy_static;
 use once_cell::sync::Lazy;
 use tokio::sync::mpsc;
@@ -25,6 +26,12 @@ use wasmer_wasix::{
     WasiTtyState,
 };
 
+use crate::tasks::{
+    thread_pool_worker::{CURRENT_WORKER_ID, HOST_EXEC_INT32_VIEW},
+    SchedulerMessage, WorkerMessage,
+};
+use serde_json;
+
 lazy_static! {
     /// We initialize the ThreadPool lazily
     static ref DEFAULT_THREAD_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new());
@@ -34,11 +41,6 @@ use crate::{tasks::ThreadPool, utils::Error};
 
 /// A weak reference to the global [`Runtime`].
 static GLOBAL_RUNTIME: Lazy<Mutex<Weak<Runtime>>> = Lazy::new(Mutex::default);
-
-// Thread-local storage for the host_exec handler (JS function cannot be Send+Sync)
-thread_local! {
-    static HOST_EXEC_HANDLER: std::cell::RefCell<Option<js_sys::Function>> = std::cell::RefCell::new(None);
-}
 
 /// State for a host execution session.
 #[derive(Debug)]
@@ -164,7 +166,9 @@ impl Runtime {
 
     /// Set the host_exec handler function.
     pub fn set_host_exec_handler(&self, handler: js_sys::Function) {
-        HOST_EXEC_HANDLER.with(|h| {
+        // Store the handler in the scheduler's thread-local storage
+        // (the scheduler runs on the main thread where this is called)
+        crate::tasks::scheduler::HOST_EXEC_HANDLER.with(|h| {
             *h.borrow_mut() = Some(handler);
         });
     }
@@ -304,77 +308,154 @@ impl HostExecRuntime for HostExecImpl {
         &self,
         request: HostExecRequest,
     ) -> BoxFuture<'_, Result<HostExecSession, anyhow::Error>> {
-        // Get handler from thread-local
-        let handler = HOST_EXEC_HANDLER.with(|h| h.borrow().clone());
+        // Generate a unique session ID
+        let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
 
-        // Check handler exists first
-        let handler = match handler {
-            Some(h) => h,
+        // Get the current worker ID from thread-local storage
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
             None => {
-                return Box::pin(async { Err(anyhow::anyhow!("host_exec handler not registered")) });
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_start called outside of worker thread"))
+                });
             }
         };
 
-        // Allocate session ID
-        let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-
-        // Create channels for I/O
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(32);
-        let (output_tx, output_rx) = mpsc::channel::<HostExecOutput>(32);
-
-        // Store session state
-        let session_state = Arc::new(HostExecSessionState {
-            stdin_tx,
-            output_rx: tokio::sync::Mutex::new(output_rx),
-        });
-        self.sessions.lock().unwrap().insert(session_id, session_state);
-
-        // Create the context object for JS
-        let context = create_host_exec_context(&request, stdin_rx, output_tx);
-
-        // Call the JS handler synchronously (it may return a promise)
-        let this = wasm_bindgen::JsValue::NULL;
-        let result = handler.call1(&this, &context);
-
-        match result {
-            Ok(_promise) => {
-                // The handler returned - it may be a promise that resolves to exit code
-                // For now, the exit code handling is done in the JS side
-                Box::pin(async move { Ok(session_id) })
-            }
+        // Serialize the request
+        let request_json = match serde_json::to_vec(&request) {
+            Ok(json) => json,
             Err(e) => {
-                // Clean up session on error
-                self.sessions.lock().unwrap().remove(&session_id);
-                // Format error message here to avoid capturing JsValue in async block
-                let err_msg = format!("host_exec handler failed: {:?}", e);
-                Box::pin(async move { Err(anyhow::anyhow!(err_msg)) })
+                let err_msg = format!("Failed to serialize request: {}", e);
+                return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
             }
+        };
+
+        // Send the request to the scheduler (main thread)
+        // We use session_id as request_id for simplicity
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecStart {
+            worker_id,
+            request_id: session_id,
+            request_json,
+        });
+
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec request: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
         }
+
+        // Return session_id immediately without waiting
+        // The actual result will be fetched by host_exec_read
+        Box::pin(async move { Ok(session_id) })
     }
 
     fn host_exec_read(
         &self,
         session: HostExecSession,
     ) -> BoxFuture<'_, Result<HostExecOutput, anyhow::Error>> {
-        // Get session state before entering async block
-        let session_state = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&session)
-            .cloned();
+        // Get current worker ID
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
+            None => {
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_read called outside of worker thread"))
+                });
+            }
+        };
+
+        let request_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+
+        // Send read request to scheduler via postMessage
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecRead {
+            worker_id,
+            request_id,
+            session_id: session,
+        });
+
+        web_sys::console::warn_1(&format!("[worker] sending HostExecRead request={} session={}", request_id, session).into());
+
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec_read: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
+        }
+
+        // Now block using Atomics.wait() until the main thread writes the response
+        // Buffer layout (Int32Array indices):
+        //   [0]: status flag (0 = waiting, 1 = response ready)
+        //   [1]: msg_type (1 = stdout, 2 = stderr, 3 = exit)
+        //   [2]: data_len or exit_code
+        //   [3]: session_id (for verification)
+        //   [4+]: data bytes (packed into i32s)
 
         Box::pin(async move {
-            let session_state = session_state
-                .ok_or_else(|| anyhow::anyhow!("invalid session: {}", session))?;
+            HOST_EXEC_INT32_VIEW.with(|view_cell| {
+                let view_opt = view_cell.borrow();
+                let view = view_opt.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("host_exec buffer not initialized"))?;
 
-            let mut rx = session_state.output_rx.lock().await;
-            let output = rx
-                .recv()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("session closed unexpectedly"))?;
+                // Reset status to 0 (waiting) before blocking
+                Atomics::store(view, 0, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
 
-            Ok(output)
+                web_sys::console::warn_1(&format!("[worker] calling Atomics.wait for session={}", session).into());
+
+                // Block until status becomes non-zero (response ready)
+                // This is the key: Atomics.wait() blocks the thread but can be woken by Atomics.notify()
+                let wait_result = Atomics::wait(view, 0, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::wait failed: {:?}", e))?;
+
+                web_sys::console::warn_1(&format!("[worker] Atomics.wait returned: {:?}", wait_result).into());
+
+                // Read the response from the buffer
+                let msg_type = Atomics::load(view, 1)
+                    .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))? as u32;
+                let data_len_or_exit_code = Atomics::load(view, 2)
+                    .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))?;
+                let response_session = Atomics::load(view, 3)
+                    .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))? as u64;
+
+                web_sys::console::warn_1(&format!(
+                    "[worker] read response: msg_type={}, data_len_or_exit={}, session={}",
+                    msg_type, data_len_or_exit_code, response_session
+                ).into());
+
+                // Verify session matches
+                if response_session != session {
+                    return Err(anyhow::anyhow!(
+                        "session mismatch: expected {}, got {}",
+                        session, response_session
+                    ));
+                }
+
+                // Convert to HostExecOutput based on msg_type
+                match msg_type {
+                    3 => {
+                        // MSG_TYPE_EXIT
+                        Ok(HostExecOutput::Exit(data_len_or_exit_code))
+                    }
+                    1 | 2 => {
+                        // MSG_TYPE_STDOUT or MSG_TYPE_STDERR
+                        let data_len = data_len_or_exit_code as usize;
+                        let mut data = vec![0u8; data_len];
+
+                        // Read data bytes from buffer starting at index 4 (byte offset 16)
+                        // Use Uint8Array view for byte-level access
+                        let buffer = view.buffer();
+                        let uint8_view = js_sys::Uint8Array::new(&buffer);
+
+                        // Data starts at byte offset 16 (4 * sizeof(i32))
+                        for i in 0..data_len {
+                            data[i] = uint8_view.get_index((16 + i) as u32) as u8;
+                        }
+
+                        if msg_type == 1 {
+                            Ok(HostExecOutput::Stdout(data))
+                        } else {
+                            Ok(HostExecOutput::Stderr(data))
+                        }
+                    }
+                    _ => Err(anyhow::anyhow!("Unknown message type: {}", msg_type)),
+                }
+            })
         })
     }
 
