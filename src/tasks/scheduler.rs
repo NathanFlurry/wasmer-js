@@ -32,6 +32,17 @@ const MSG_TYPE_STDOUT: u32 = 1;
 const MSG_TYPE_STDERR: u32 = 2;
 const MSG_TYPE_EXIT: u32 = 3;
 
+/// Message type constants for child process IPC (Node -> WASM via OUTPUT_QUEUES).
+const MSG_TYPE_SPAWN_REQUEST: u32 = 10;
+const MSG_TYPE_SPAWN_STDIN: u32 = 11;
+const MSG_TYPE_SPAWN_CLOSE_STDIN: u32 = 12;
+const MSG_TYPE_SPAWN_KILL: u32 = 13;
+
+/// Message type constants for child process output (WASM -> Node via callbacks).
+const MSG_TYPE_CHILD_STDOUT: u32 = 20;
+const MSG_TYPE_CHILD_STDERR: u32 = 21;
+const MSG_TYPE_CHILD_EXIT: u32 = 22;
+
 /// Stores the exit code for completed host_exec sessions.
 /// Key is session_id, value is exit code.
 static HOST_EXEC_RESULTS: Lazy<Mutex<HashMap<u64, i32>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -55,6 +66,15 @@ thread_local! {
 thread_local! {
     static SIGNAL_HANDLERS: std::cell::RefCell<HashMap<u64, js_sys::Function>> = std::cell::RefCell::new(HashMap::new());
 }
+
+/// Stores child process output callbacks for each session (thread-local since JS functions aren't Send+Sync).
+/// Key is session_id, value is (onChildStdout, onChildStderr, onChildExit).
+thread_local! {
+    static CHILD_OUTPUT_HANDLERS: std::cell::RefCell<HashMap<u64, (js_sys::Function, js_sys::Function, js_sys::Function)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Counter for generating unique child IDs within a session.
+static NEXT_CHILD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A handle for interacting with the threadpool's scheduler.
 #[derive(Debug, Clone)]
@@ -484,6 +504,50 @@ impl SchedulerState {
 
                 Ok(())
             }
+            SchedulerMessage::HostExecChildOutput { worker_id: _, request_id: _, session_id, child_id, msg_type, data } => {
+                tracing::debug!(session_id, child_id, msg_type, data_len = data.len(), "Received host_exec_child_output");
+
+                // Look up the child output handlers for this session and call appropriate callback
+                CHILD_OUTPUT_HANDLERS.with(|handlers| {
+                    if let Some((stdout_fn, stderr_fn, exit_fn)) = handlers.borrow().get(&session_id) {
+                        let child_id_val = JsValue::from_f64(child_id as f64);
+
+                        match msg_type {
+                            MSG_TYPE_CHILD_STDOUT => {
+                                let data_array = js_sys::Uint8Array::from(data.as_slice());
+                                if let Err(e) = stdout_fn.call2(&JsValue::NULL, &child_id_val, &data_array) {
+                                    tracing::warn!(session_id, child_id, ?e, "Failed to call onChildStdout");
+                                }
+                            }
+                            MSG_TYPE_CHILD_STDERR => {
+                                let data_array = js_sys::Uint8Array::from(data.as_slice());
+                                if let Err(e) = stderr_fn.call2(&JsValue::NULL, &child_id_val, &data_array) {
+                                    tracing::warn!(session_id, child_id, ?e, "Failed to call onChildStderr");
+                                }
+                            }
+                            MSG_TYPE_CHILD_EXIT => {
+                                // data contains exit code as 4 bytes
+                                let exit_code = if data.len() >= 4 {
+                                    i32::from_le_bytes([data[0], data[1], data[2], data[3]])
+                                } else {
+                                    0
+                                };
+                                let exit_code_val = JsValue::from_f64(exit_code as f64);
+                                if let Err(e) = exit_fn.call2(&JsValue::NULL, &child_id_val, &exit_code_val) {
+                                    tracing::warn!(session_id, child_id, ?e, "Failed to call onChildExit");
+                                }
+                            }
+                            _ => {
+                                tracing::warn!(session_id, child_id, msg_type, "Unknown child output message type");
+                            }
+                        }
+                    } else {
+                        tracing::warn!(session_id, "No child output handlers found for session");
+                    }
+                });
+
+                Ok(())
+            }
             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
         }
     }
@@ -823,6 +887,167 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
         js_sys::Reflect::set(&term_obj, &JsValue::from_str("rows"), &JsValue::from_f64(terminal.rows as f64)).ok();
         js_sys::Reflect::set(&obj, &JsValue::from_str("terminal"), &term_obj).ok();
     }
+
+    // Create requestSpawn callback - Node calls this to spawn a child process inside WASM
+    // Returns a child_id that can be used to identify the child
+    let spawn_scheduler = scheduler.clone();
+    let request_spawn: Closure<dyn Fn(JsValue, JsValue, JsValue, JsValue) -> JsValue> = Closure::new(move |command: JsValue, args: JsValue, env: JsValue, cwd: JsValue| {
+        // Generate unique child ID
+        let child_id = NEXT_CHILD_ID.fetch_add(1, Ordering::SeqCst);
+
+        // Build spawn request JSON
+        let spawn_request = js_sys::Object::new();
+        js_sys::Reflect::set(&spawn_request, &JsValue::from_str("child_id"), &JsValue::from_f64(child_id as f64)).ok();
+        js_sys::Reflect::set(&spawn_request, &JsValue::from_str("command"), &command).ok();
+        js_sys::Reflect::set(&spawn_request, &JsValue::from_str("args"), &args).ok();
+        js_sys::Reflect::set(&spawn_request, &JsValue::from_str("env"), &env).ok();
+        js_sys::Reflect::set(&spawn_request, &JsValue::from_str("cwd"), &cwd).ok();
+
+        // Serialize to JSON bytes
+        let json_str = js_sys::JSON::stringify(&spawn_request)
+            .map(|s| s.as_string().unwrap_or_default())
+            .unwrap_or_default();
+        let json_bytes = json_str.into_bytes();
+
+        // Queue spawn request for WASM to read
+        OUTPUT_QUEUES.lock().unwrap()
+            .entry(session_id)
+            .or_default()
+            .push_back((MSG_TYPE_SPAWN_REQUEST, json_bytes));
+
+        // Check if there's a pending read - if so, send immediately
+        if let Some((worker_id, req_session_id)) = PENDING_READS.lock().unwrap().remove(&session_id) {
+            if let Some((msg_type, data)) = OUTPUT_QUEUES.lock().unwrap()
+                .get_mut(&session_id)
+                .and_then(|q| q.pop_front())
+            {
+                let msg = SchedulerMessage::HostExecReadComplete {
+                    worker_id,
+                    request_id: req_session_id,
+                    msg_type,
+                    data,
+                };
+                let _ = spawn_scheduler.send(msg);
+            }
+        }
+
+        JsValue::from_f64(child_id as f64)
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("requestSpawn"), &request_spawn.into_js_value()).ok();
+
+    // Create spawnWriteStdin callback - write data to a child's stdin
+    let stdin_scheduler = scheduler.clone();
+    let spawn_write_stdin: Closure<dyn Fn(JsValue, JsValue)> = Closure::new(move |child_id: JsValue, data: JsValue| {
+        let child_id = child_id.as_f64().unwrap_or(0.0) as u64;
+
+        if let Ok(array) = data.dyn_into::<js_sys::Uint8Array>() {
+            // Build message: child_id (8 bytes) + data
+            let mut msg_data = Vec::with_capacity(8 + array.length() as usize);
+            msg_data.extend_from_slice(&child_id.to_le_bytes());
+            msg_data.extend_from_slice(&array.to_vec());
+
+            OUTPUT_QUEUES.lock().unwrap()
+                .entry(session_id)
+                .or_default()
+                .push_back((MSG_TYPE_SPAWN_STDIN, msg_data));
+
+            // Wake pending read if any
+            if let Some((worker_id, req_session_id)) = PENDING_READS.lock().unwrap().remove(&session_id) {
+                if let Some((msg_type, data)) = OUTPUT_QUEUES.lock().unwrap()
+                    .get_mut(&session_id)
+                    .and_then(|q| q.pop_front())
+                {
+                    let msg = SchedulerMessage::HostExecReadComplete {
+                        worker_id,
+                        request_id: req_session_id,
+                        msg_type,
+                        data,
+                    };
+                    let _ = stdin_scheduler.send(msg);
+                }
+            }
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("spawnWriteStdin"), &spawn_write_stdin.into_js_value()).ok();
+
+    // Create spawnCloseStdin callback - close a child's stdin
+    let close_scheduler = scheduler.clone();
+    let spawn_close_stdin: Closure<dyn Fn(JsValue)> = Closure::new(move |child_id: JsValue| {
+        let child_id = child_id.as_f64().unwrap_or(0.0) as u64;
+
+        // Build message: just child_id (8 bytes)
+        let msg_data = child_id.to_le_bytes().to_vec();
+
+        OUTPUT_QUEUES.lock().unwrap()
+            .entry(session_id)
+            .or_default()
+            .push_back((MSG_TYPE_SPAWN_CLOSE_STDIN, msg_data));
+
+        // Wake pending read if any
+        if let Some((worker_id, req_session_id)) = PENDING_READS.lock().unwrap().remove(&session_id) {
+            if let Some((msg_type, data)) = OUTPUT_QUEUES.lock().unwrap()
+                .get_mut(&session_id)
+                .and_then(|q| q.pop_front())
+            {
+                let msg = SchedulerMessage::HostExecReadComplete {
+                    worker_id,
+                    request_id: req_session_id,
+                    msg_type,
+                    data,
+                };
+                let _ = close_scheduler.send(msg);
+            }
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("spawnCloseStdin"), &spawn_close_stdin.into_js_value()).ok();
+
+    // Create spawnKill callback - send signal to a child
+    let kill_scheduler = scheduler.clone();
+    let spawn_kill: Closure<dyn Fn(JsValue, JsValue)> = Closure::new(move |child_id: JsValue, signal: JsValue| {
+        let child_id = child_id.as_f64().unwrap_or(0.0) as u64;
+        let signal = signal.as_f64().unwrap_or(15.0) as u32; // Default SIGTERM
+
+        // Build message: child_id (8 bytes) + signal (4 bytes)
+        let mut msg_data = Vec::with_capacity(12);
+        msg_data.extend_from_slice(&child_id.to_le_bytes());
+        msg_data.extend_from_slice(&signal.to_le_bytes());
+
+        OUTPUT_QUEUES.lock().unwrap()
+            .entry(session_id)
+            .or_default()
+            .push_back((MSG_TYPE_SPAWN_KILL, msg_data));
+
+        // Wake pending read if any
+        if let Some((worker_id, req_session_id)) = PENDING_READS.lock().unwrap().remove(&session_id) {
+            if let Some((msg_type, data)) = OUTPUT_QUEUES.lock().unwrap()
+                .get_mut(&session_id)
+                .and_then(|q| q.pop_front())
+            {
+                let msg = SchedulerMessage::HostExecReadComplete {
+                    worker_id,
+                    request_id: req_session_id,
+                    msg_type,
+                    data,
+                };
+                let _ = kill_scheduler.send(msg);
+            }
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("spawnKill"), &spawn_kill.into_js_value()).ok();
+
+    // Create setChildOutputHandlers callback - Node registers callbacks for child output
+    let set_child_handlers: Closure<dyn Fn(JsValue, JsValue, JsValue)> = Closure::new(move |on_stdout: JsValue, on_stderr: JsValue, on_exit: JsValue| {
+        if let (Ok(stdout_fn), Ok(stderr_fn), Ok(exit_fn)) = (
+            on_stdout.dyn_into::<js_sys::Function>(),
+            on_stderr.dyn_into::<js_sys::Function>(),
+            on_exit.dyn_into::<js_sys::Function>(),
+        ) {
+            CHILD_OUTPUT_HANDLERS.with(|handlers| {
+                handlers.borrow_mut().insert(session_id, (stdout_fn, stderr_fn, exit_fn));
+            });
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("setChildOutputHandlers"), &set_child_handlers.into_js_value()).ok();
 
     obj.into()
 }
