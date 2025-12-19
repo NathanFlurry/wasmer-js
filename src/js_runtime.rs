@@ -63,6 +63,15 @@ impl JsRuntime {
             None => Ok(None),
         }
     }
+
+    /// Register a handler for host_exec syscalls.
+    ///
+    /// The handler is called when a WASM program invokes host_exec_start.
+    /// It receives a context object with command, args, env, cwd, and I/O streams.
+    #[wasm_bindgen(js_name = "setHostExecHandler")]
+    pub fn set_host_exec_handler(&self, handler: js_sys::Function) {
+        self.rt.set_host_exec_handler(handler);
+    }
 }
 
 impl Deref for JsRuntime {
@@ -115,6 +124,70 @@ export type RuntimeOptions = {
      */
     networkGateway?: string;
 };
+"#;
+
+#[wasm_bindgen(typescript_custom_section)]
+const HOST_EXEC_TYPE_DECLARATIONS: &str = r#"
+/**
+ * Context passed to host_exec handlers.
+ *
+ * This object is provided when a WASM program calls host_exec_start
+ * to delegate execution to JavaScript.
+ */
+export interface HostExecContext {
+    /**
+     * The command name (e.g., "node").
+     */
+    command: string;
+
+    /**
+     * Command-line arguments.
+     */
+    args: string[];
+
+    /**
+     * Environment variables.
+     */
+    env: Record<string, string>;
+
+    /**
+     * Current working directory.
+     */
+    cwd: string;
+
+    /**
+     * Stdin stream from WASM.
+     * Read from this to get stdin data sent by the WASM process.
+     * Currently null - streaming I/O not yet implemented.
+     */
+    stdin: ReadableStream<Uint8Array> | null;
+
+    /**
+     * Stdout stream to WASM.
+     * Write to this to send stdout data to the WASM process.
+     * Currently null - streaming I/O not yet implemented.
+     */
+    stdout: WritableStream<Uint8Array> | null;
+
+    /**
+     * Stderr stream to WASM.
+     * Write to this to send stderr data to the WASM process.
+     * Currently null - streaming I/O not yet implemented.
+     */
+    stderr: WritableStream<Uint8Array> | null;
+}
+
+/**
+ * Handler for host_exec syscalls.
+ *
+ * The handler should:
+ * 1. Read from ctx.stdin as needed
+ * 2. Write output to ctx.stdout and ctx.stderr
+ * 3. Return the exit code (or a Promise resolving to it)
+ *
+ * The streams are automatically closed when the Promise resolves.
+ */
+export type HostExecHandler = (ctx: HostExecContext) => number | Promise<number>;
 "#;
 
 #[wasm_bindgen]

@@ -1,8 +1,15 @@
-use std::sync::{atomic::AtomicBool, Arc, Mutex, Weak};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+    },
+};
 
-use reqwest::header::HeaderValue;
+use futures::future::BoxFuture;
 use lazy_static::lazy_static;
 use once_cell::sync::Lazy;
+use tokio::sync::mpsc;
 use virtual_net::VirtualNetworking;
 use wasmer_config::package::PackageSource;
 use wasmer_wasix::{
@@ -11,7 +18,8 @@ use wasmer_wasix::{
     runtime::{
         module_cache::ThreadLocalCache,
         package_loader::PackageLoader,
-        resolver::{PackageSummary, QueryError, Source, BackendSource},
+        resolver::{BackendSource, PackageSummary, QueryError, Source},
+        DynHostExecRuntime, HostExecOutput, HostExecRequest, HostExecRuntime, HostExecSession,
     },
     VirtualTaskManager, WasiTtyState,
 };
@@ -26,6 +34,29 @@ use crate::{tasks::ThreadPool, utils::Error};
 /// A weak reference to the global [`Runtime`].
 static GLOBAL_RUNTIME: Lazy<Mutex<Weak<Runtime>>> = Lazy::new(Mutex::default);
 
+// Thread-local storage for the host_exec handler (JS function cannot be Send+Sync)
+thread_local! {
+    static HOST_EXEC_HANDLER: std::cell::RefCell<Option<js_sys::Function>> = std::cell::RefCell::new(None);
+}
+
+/// State for a host execution session.
+#[derive(Debug)]
+struct HostExecSessionState {
+    /// Channel to send stdin data to JS handler.
+    stdin_tx: mpsc::Sender<Vec<u8>>,
+    /// Channel to receive output from JS handler.
+    output_rx: tokio::sync::Mutex<mpsc::Receiver<HostExecOutput>>,
+}
+
+/// Host execution runtime implementation.
+#[derive(Default, Debug)]
+pub struct HostExecImpl {
+    /// Active sessions.
+    sessions: Mutex<HashMap<HostExecSession, Arc<HostExecSessionState>>>,
+    /// Counter for unique session IDs.
+    next_session_id: AtomicU64,
+}
+
 /// Runtime components used when running WebAssembly programs.
 #[derive(Clone, derivative::Derivative)]
 #[derivative(Debug)]
@@ -38,6 +69,8 @@ pub struct Runtime {
     module_cache: Arc<ThreadLocalCache>,
     tty: TtyOptions,
     connected_to_tty: Arc<AtomicBool>,
+    #[derivative(Debug = "ignore")]
+    host_exec: Arc<HostExecImpl>,
 }
 
 impl Runtime {
@@ -124,7 +157,20 @@ impl Runtime {
             module_cache: Arc::new(module_cache),
             tty: TtyOptions::default(),
             connected_to_tty: Arc::new(AtomicBool::new(false)),
+            host_exec: Arc::new(HostExecImpl::default()),
         }
+    }
+
+    /// Set the host_exec handler function.
+    pub fn set_host_exec_handler(&self, handler: js_sys::Function) {
+        HOST_EXEC_HANDLER.with(|h| {
+            *h.borrow_mut() = Some(handler);
+        });
+    }
+
+    /// Get a reference to the host_exec implementation.
+    pub fn host_exec_impl(&self) -> &Arc<HostExecImpl> {
+        &self.host_exec
     }
 
     /// Set the registry that packages will be fetched from.
@@ -204,6 +250,10 @@ impl wasmer_wasix::runtime::Runtime for Runtime {
     fn tty(&self) -> Option<&(dyn wasmer_wasix::os::TtyBridge + Send + Sync)> {
         Some(self)
     }
+
+    fn host_exec(&self) -> DynHostExecRuntime {
+        self.host_exec.clone()
+    }
 }
 
 impl TtyBridge for Runtime {
@@ -246,6 +296,204 @@ impl TtyBridge for Runtime {
             tty_state.stdin_tty || tty_state.stdout_tty || tty_state.stderr_tty,
         );
     }
+}
+
+impl HostExecRuntime for HostExecImpl {
+    fn host_exec_start(
+        &self,
+        request: HostExecRequest,
+    ) -> BoxFuture<'_, Result<HostExecSession, anyhow::Error>> {
+        // Get handler from thread-local
+        let handler = HOST_EXEC_HANDLER.with(|h| h.borrow().clone());
+
+        // Check handler exists first
+        let handler = match handler {
+            Some(h) => h,
+            None => {
+                return Box::pin(async { Err(anyhow::anyhow!("host_exec handler not registered")) });
+            }
+        };
+
+        // Allocate session ID
+        let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+
+        // Create channels for I/O
+        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (output_tx, output_rx) = mpsc::channel::<HostExecOutput>(32);
+
+        // Store session state
+        let session_state = Arc::new(HostExecSessionState {
+            stdin_tx,
+            output_rx: tokio::sync::Mutex::new(output_rx),
+        });
+        self.sessions.lock().unwrap().insert(session_id, session_state);
+
+        // Create the context object for JS
+        let context = create_host_exec_context(&request, stdin_rx, output_tx);
+
+        // Call the JS handler synchronously (it may return a promise)
+        let this = wasm_bindgen::JsValue::NULL;
+        let result = handler.call1(&this, &context);
+
+        match result {
+            Ok(_promise) => {
+                // The handler returned - it may be a promise that resolves to exit code
+                // For now, the exit code handling is done in the JS side
+                Box::pin(async move { Ok(session_id) })
+            }
+            Err(e) => {
+                // Clean up session on error
+                self.sessions.lock().unwrap().remove(&session_id);
+                // Format error message here to avoid capturing JsValue in async block
+                let err_msg = format!("host_exec handler failed: {:?}", e);
+                Box::pin(async move { Err(anyhow::anyhow!(err_msg)) })
+            }
+        }
+    }
+
+    fn host_exec_read(
+        &self,
+        session: HostExecSession,
+    ) -> BoxFuture<'_, Result<HostExecOutput, anyhow::Error>> {
+        // Get session state before entering async block
+        let session_state = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .cloned();
+
+        Box::pin(async move {
+            let session_state = session_state
+                .ok_or_else(|| anyhow::anyhow!("invalid session: {}", session))?;
+
+            let mut rx = session_state.output_rx.lock().await;
+            let output = rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("session closed unexpectedly"))?;
+
+            Ok(output)
+        })
+    }
+
+    fn host_exec_write(
+        &self,
+        session: HostExecSession,
+        data: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        // Get session state before entering async block
+        let session_state = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .cloned();
+
+        Box::pin(async move {
+            let session_state = session_state
+                .ok_or_else(|| anyhow::anyhow!("invalid session: {}", session))?;
+
+            session_state
+                .stdin_tx
+                .send(data)
+                .await
+                .map_err(|_| anyhow::anyhow!("stdin channel closed"))?;
+
+            Ok(())
+        })
+    }
+
+    fn host_exec_close_stdin(
+        &self,
+        session: HostExecSession,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        // Get session state before entering async block
+        let session_state = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .cloned();
+
+        Box::pin(async move {
+            // Verify the session exists
+            let _session_state = session_state
+                .ok_or_else(|| anyhow::anyhow!("invalid session: {}", session))?;
+
+            // The stdin channel will be closed when all senders are dropped
+            // For explicit close, we'd need to track this separately
+            Ok(())
+        })
+    }
+}
+
+/// Create the HostExecContext object for the JS handler.
+fn create_host_exec_context(
+    request: &HostExecRequest,
+    _stdin_rx: mpsc::Receiver<Vec<u8>>,
+    _output_tx: mpsc::Sender<HostExecOutput>,
+) -> wasm_bindgen::JsValue {
+    // Create a JS object with the context
+    let obj = js_sys::Object::new();
+
+    // Set command
+    js_sys::Reflect::set(
+        &obj,
+        &wasm_bindgen::JsValue::from_str("command"),
+        &wasm_bindgen::JsValue::from_str(&request.command),
+    )
+    .ok();
+
+    // Set args
+    let args = js_sys::Array::new();
+    for arg in &request.args {
+        args.push(&wasm_bindgen::JsValue::from_str(arg));
+    }
+    js_sys::Reflect::set(&obj, &wasm_bindgen::JsValue::from_str("args"), &args).ok();
+
+    // Set env
+    let env = js_sys::Object::new();
+    for (key, value) in &request.env {
+        js_sys::Reflect::set(
+            &env,
+            &wasm_bindgen::JsValue::from_str(key),
+            &wasm_bindgen::JsValue::from_str(value),
+        )
+        .ok();
+    }
+    js_sys::Reflect::set(&obj, &wasm_bindgen::JsValue::from_str("env"), &env).ok();
+
+    // Set cwd
+    js_sys::Reflect::set(
+        &obj,
+        &wasm_bindgen::JsValue::from_str("cwd"),
+        &wasm_bindgen::JsValue::from_str(&request.cwd),
+    )
+    .ok();
+
+    // TODO: Create Web Streams for stdin/stdout/stderr
+    // For now, we'll set these to null and handle them later
+    js_sys::Reflect::set(
+        &obj,
+        &wasm_bindgen::JsValue::from_str("stdin"),
+        &wasm_bindgen::JsValue::NULL,
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &wasm_bindgen::JsValue::from_str("stdout"),
+        &wasm_bindgen::JsValue::NULL,
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &wasm_bindgen::JsValue::from_str("stderr"),
+        &wasm_bindgen::JsValue::NULL,
+    )
+    .ok();
+
+    obj.into()
 }
 
 /// A [`Source`] that will always error out with [`QueryError::Unsupported`].
