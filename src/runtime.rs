@@ -464,49 +464,65 @@ impl HostExecRuntime for HostExecImpl {
         session: HostExecSession,
         data: Vec<u8>,
     ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
-        // Get session state before entering async block
-        let session_state = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&session)
-            .cloned();
+        // Get current worker ID
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
+            None => {
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_write called outside of worker thread"))
+                });
+            }
+        };
 
-        Box::pin(async move {
-            let session_state = session_state
-                .ok_or_else(|| anyhow::anyhow!("invalid session: {}", session))?;
+        let request_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
 
-            session_state
-                .stdin_tx
-                .send(data)
-                .await
-                .map_err(|_| anyhow::anyhow!("stdin channel closed"))?;
+        // Send write request to scheduler via postMessage
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecWrite {
+            worker_id,
+            request_id,
+            session_id: session,
+            data,
+        });
 
-            Ok(())
-        })
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec_write: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
+        }
+
+        // Return success immediately - write is fire-and-forget
+        Box::pin(async move { Ok(()) })
     }
 
     fn host_exec_close_stdin(
         &self,
         session: HostExecSession,
     ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
-        // Get session state before entering async block
-        let session_state = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&session)
-            .cloned();
+        // Get current worker ID
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
+            None => {
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_close_stdin called outside of worker thread"))
+                });
+            }
+        };
 
-        Box::pin(async move {
-            // Verify the session exists
-            let _session_state = session_state
-                .ok_or_else(|| anyhow::anyhow!("invalid session: {}", session))?;
+        let request_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
 
-            // The stdin channel will be closed when all senders are dropped
-            // For explicit close, we'd need to track this separately
-            Ok(())
-        })
+        // Send close stdin request to scheduler via postMessage
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecCloseStdin {
+            worker_id,
+            request_id,
+            session_id: session,
+        });
+
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec_close_stdin: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
+        }
+
+        // Return success immediately
+        Box::pin(async move { Ok(()) })
     }
 }
 

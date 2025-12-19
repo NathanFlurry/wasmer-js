@@ -44,6 +44,12 @@ static PENDING_READS: Lazy<Mutex<HashMap<u64, (u32, u64)>>> = Lazy::new(|| Mutex
 /// Key is session_id, value is queue of (msg_type, data).
 static OUTPUT_QUEUES: Lazy<Mutex<HashMap<u64, VecDeque<(u32, Vec<u8>)>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Stores stdin writers for each session (thread-local since JS functions aren't Send+Sync).
+/// Key is session_id, value is (writer_fn, closer_fn).
+thread_local! {
+    static STDIN_WRITERS: std::cell::RefCell<HashMap<u64, (js_sys::Function, js_sys::Function)>> = std::cell::RefCell::new(HashMap::new());
+}
+
 /// A handle for interacting with the threadpool's scheduler.
 #[derive(Debug, Clone)]
 pub(crate) struct Scheduler {
@@ -393,12 +399,30 @@ impl SchedulerState {
             }
             SchedulerMessage::HostExecWrite { worker_id, request_id, session_id, data } => {
                 tracing::debug!(worker_id, request_id, session_id, data_len = data.len(), "Received host_exec_write request");
-                // TODO: Implement
+
+                // Get the stdin writer for this session and write the data
+                STDIN_WRITERS.with(|writers| {
+                    if let Some((writer_fn, _)) = writers.borrow().get(&session_id) {
+                        // Convert data to Uint8Array and call the writer function
+                        let uint8_array = js_sys::Uint8Array::from(data.as_slice());
+                        let _ = writer_fn.call1(&JsValue::NULL, &uint8_array);
+                    } else {
+                        tracing::warn!(session_id, "No stdin writer found for session");
+                    }
+                });
                 Ok(())
             }
             SchedulerMessage::HostExecCloseStdin { worker_id, request_id, session_id } => {
                 tracing::debug!(worker_id, request_id, session_id, "Received host_exec_close_stdin request");
-                // TODO: Implement
+
+                // Get the stdin closer for this session, call it, and remove the entry
+                STDIN_WRITERS.with(|writers| {
+                    if let Some((_, closer_fn)) = writers.borrow_mut().remove(&session_id) {
+                        let _ = closer_fn.call0(&JsValue::NULL);
+                    } else {
+                        tracing::warn!(session_id, "No stdin closer found for session");
+                    }
+                });
                 Ok(())
             }
             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
@@ -652,6 +676,16 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
         }
     });
     js_sys::Reflect::set(&obj, &JsValue::from_str("onStderr"), &on_stderr.into_js_value()).ok();
+
+    // Create setStdinWriter callback - handler calls this to register stdin writer functions
+    let set_stdin_writer: Closure<dyn Fn(JsValue, JsValue)> = Closure::new(move |writer: JsValue, closer: JsValue| {
+        if let (Ok(writer_fn), Ok(closer_fn)) = (writer.dyn_into::<js_sys::Function>(), closer.dyn_into::<js_sys::Function>()) {
+            STDIN_WRITERS.with(|writers| {
+                writers.borrow_mut().insert(session_id, (writer_fn, closer_fn));
+            });
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("setStdinWriter"), &set_stdin_writer.into_js_value()).ok();
 
     obj.into()
 }
