@@ -50,6 +50,12 @@ thread_local! {
     static STDIN_WRITERS: std::cell::RefCell<HashMap<u64, (js_sys::Function, js_sys::Function)>> = std::cell::RefCell::new(HashMap::new());
 }
 
+/// Stores kill/signal functions for each session (thread-local since JS functions aren't Send+Sync).
+/// Key is session_id, value is kill_fn that takes a signal number.
+thread_local! {
+    static SIGNAL_HANDLERS: std::cell::RefCell<HashMap<u64, js_sys::Function>> = std::cell::RefCell::new(HashMap::new());
+}
+
 /// A handle for interacting with the threadpool's scheduler.
 #[derive(Debug, Clone)]
 pub(crate) struct Scheduler {
@@ -464,6 +470,23 @@ impl SchedulerState {
 
                 self.send_host_exec_poll_response(worker_id, session_id, is_ready)
             }
+            SchedulerMessage::HostExecSignal { worker_id, request_id: _, session_id, signal } => {
+                tracing::debug!(worker_id, session_id, signal, "Received host_exec_signal request");
+
+                // Get the kill function for this session and call it with the signal
+                SIGNAL_HANDLERS.with(|handlers| {
+                    if let Some(kill_fn) = handlers.borrow().get(&session_id) {
+                        let signal_val = JsValue::from_f64(signal as f64);
+                        if let Err(e) = kill_fn.call1(&JsValue::NULL, &signal_val) {
+                            tracing::warn!(session_id, ?e, "Failed to call kill function");
+                        }
+                    } else {
+                        tracing::warn!(session_id, "No kill function found for session");
+                    }
+                });
+
+                Ok(())
+            }
             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
         }
     }
@@ -784,6 +807,25 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
         }
     });
     js_sys::Reflect::set(&obj, &JsValue::from_str("setStdinWriter"), &set_stdin_writer.into_js_value()).ok();
+
+    // Create setKillFunction callback - handler calls this to register kill/signal function
+    let set_kill_function: Closure<dyn Fn(JsValue)> = Closure::new(move |kill_fn: JsValue| {
+        if let Ok(fn_obj) = kill_fn.dyn_into::<js_sys::Function>() {
+            SIGNAL_HANDLERS.with(|handlers| {
+                handlers.borrow_mut().insert(session_id, fn_obj);
+            });
+        }
+    });
+    js_sys::Reflect::set(&obj, &JsValue::from_str("setKillFunction"), &set_kill_function.into_js_value()).ok();
+
+    // Set terminal options if present
+    if let Some(ref terminal) = request.terminal {
+        let term_obj = js_sys::Object::new();
+        js_sys::Reflect::set(&term_obj, &JsValue::from_str("term"), &JsValue::from_str(&terminal.term)).ok();
+        js_sys::Reflect::set(&term_obj, &JsValue::from_str("cols"), &JsValue::from_f64(terminal.cols as f64)).ok();
+        js_sys::Reflect::set(&term_obj, &JsValue::from_str("rows"), &JsValue::from_f64(terminal.rows as f64)).ok();
+        js_sys::Reflect::set(&obj, &JsValue::from_str("terminal"), &term_obj).ok();
+    }
 
     obj.into()
 }

@@ -1,16 +1,12 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, Weak,
-    },
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, Weak,
 };
 
 use futures::future::BoxFuture;
 use js_sys::Atomics;
 use lazy_static::lazy_static;
 use once_cell::sync::Lazy;
-use tokio::sync::mpsc;
 use virtual_net::VirtualNetworking;
 use wasmer_config::package::PackageSource;
 use wasmer_wasix::{
@@ -21,6 +17,7 @@ use wasmer_wasix::{
         package_loader::PackageLoader,
         resolver::{BackendSource, PackageSummary, QueryError, Source},
         DynHostExecRuntime, HostExecOutput, HostExecRequest, HostExecRuntime, HostExecSession,
+        Signal,
     },
     VirtualTaskManager,
     WasiTtyState,
@@ -42,20 +39,9 @@ use crate::{tasks::ThreadPool, utils::Error};
 /// A weak reference to the global [`Runtime`].
 static GLOBAL_RUNTIME: Lazy<Mutex<Weak<Runtime>>> = Lazy::new(Mutex::default);
 
-/// State for a host execution session.
-#[derive(Debug)]
-struct HostExecSessionState {
-    /// Channel to send stdin data to JS handler.
-    stdin_tx: mpsc::Sender<Vec<u8>>,
-    /// Channel to receive output from JS handler.
-    output_rx: tokio::sync::Mutex<mpsc::Receiver<HostExecOutput>>,
-}
-
 /// Host execution runtime implementation.
 #[derive(Default, Debug)]
 pub struct HostExecImpl {
-    /// Active sessions.
-    sessions: Mutex<HashMap<HostExecSession, Arc<HostExecSessionState>>>,
     /// Counter for unique session IDs.
     next_session_id: AtomicU64,
 }
@@ -668,74 +654,43 @@ impl HostExecRuntime for HostExecImpl {
             })
         })
     }
-}
 
-/// Create the HostExecContext object for the JS handler.
-fn create_host_exec_context(
-    request: &HostExecRequest,
-    _stdin_rx: mpsc::Receiver<Vec<u8>>,
-    _output_tx: mpsc::Sender<HostExecOutput>,
-) -> wasm_bindgen::JsValue {
-    // Create a JS object with the context
-    let obj = js_sys::Object::new();
+    fn host_exec_signal(
+        &self,
+        session: HostExecSession,
+        sig: Signal,
+    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+        // Get current worker ID
+        let worker_id = match CURRENT_WORKER_ID.get() {
+            Some(id) => id,
+            None => {
+                return Box::pin(async move {
+                    Err(anyhow::anyhow!("host_exec_signal called outside of worker thread"))
+                });
+            }
+        };
 
-    // Set command
-    js_sys::Reflect::set(
-        &obj,
-        &wasm_bindgen::JsValue::from_str("command"),
-        &wasm_bindgen::JsValue::from_str(&request.command),
-    )
-    .ok();
+        let request_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
 
-    // Set args
-    let args = js_sys::Array::new();
-    for arg in &request.args {
-        args.push(&wasm_bindgen::JsValue::from_str(arg));
+        // Convert Signal enum to u32
+        let signal = sig as u32;
+
+        // Send signal request to scheduler via postMessage
+        let msg = WorkerMessage::Scheduler(SchedulerMessage::HostExecSignal {
+            worker_id,
+            request_id,
+            session_id: session,
+            signal,
+        });
+
+        if let Err(e) = msg.emit() {
+            let err_msg = format!("Failed to send host_exec_signal: {:?}", e);
+            return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
+        }
+
+        // Return success immediately - signal is fire-and-forget
+        Box::pin(async move { Ok(()) })
     }
-    js_sys::Reflect::set(&obj, &wasm_bindgen::JsValue::from_str("args"), &args).ok();
-
-    // Set env
-    let env = js_sys::Object::new();
-    for (key, value) in &request.env {
-        js_sys::Reflect::set(
-            &env,
-            &wasm_bindgen::JsValue::from_str(key),
-            &wasm_bindgen::JsValue::from_str(value),
-        )
-        .ok();
-    }
-    js_sys::Reflect::set(&obj, &wasm_bindgen::JsValue::from_str("env"), &env).ok();
-
-    // Set cwd
-    js_sys::Reflect::set(
-        &obj,
-        &wasm_bindgen::JsValue::from_str("cwd"),
-        &wasm_bindgen::JsValue::from_str(&request.cwd),
-    )
-    .ok();
-
-    // TODO: Create Web Streams for stdin/stdout/stderr
-    // For now, we'll set these to null and handle them later
-    js_sys::Reflect::set(
-        &obj,
-        &wasm_bindgen::JsValue::from_str("stdin"),
-        &wasm_bindgen::JsValue::NULL,
-    )
-    .ok();
-    js_sys::Reflect::set(
-        &obj,
-        &wasm_bindgen::JsValue::from_str("stdout"),
-        &wasm_bindgen::JsValue::NULL,
-    )
-    .ok();
-    js_sys::Reflect::set(
-        &obj,
-        &wasm_bindgen::JsValue::from_str("stderr"),
-        &wasm_bindgen::JsValue::NULL,
-    )
-    .ok();
-
-    obj.into()
 }
 
 /// A [`Source`] that will always error out with [`QueryError::Unsupported`].

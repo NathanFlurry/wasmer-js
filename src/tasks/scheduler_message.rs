@@ -71,6 +71,13 @@ pub(crate) enum SchedulerMessage {
         request_id: u64,
         session_id: u64,
     },
+    /// Host execution signal request.
+    HostExecSignal {
+        worker_id: u32,
+        request_id: u64,
+        session_id: u64,
+        signal: u32,
+    },
     /// Internal message: host_exec read completed (async Promise resolved).
     HostExecReadComplete {
         worker_id: u32,
@@ -235,6 +242,18 @@ impl SchedulerMessage {
                     session_id,
                 })
             }
+            consts::TYPE_HOST_EXEC_SIGNAL => {
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let request_id = de.serde(consts::REQUEST_ID)?;
+                let session_id = de.serde(consts::SESSION_ID)?;
+                let signal = de.serde(consts::SIGNAL)?;
+                Ok(SchedulerMessage::HostExecSignal {
+                    worker_id,
+                    request_id,
+                    session_id,
+                    signal,
+                })
+            }
             other => {
                 tracing::warn!(r#type = other, "Unknown message type");
                 Err(anyhow::anyhow!("Unknown message type, \"{other}\"").into())
@@ -348,6 +367,17 @@ impl SchedulerMessage {
                 .set(consts::REQUEST_ID, request_id)
                 .set(consts::SESSION_ID, session_id)
                 .finish(),
+            SchedulerMessage::HostExecSignal {
+                worker_id,
+                request_id,
+                session_id,
+                signal,
+            } => Serializer::new(consts::TYPE_HOST_EXEC_SIGNAL)
+                .set(consts::WORKER_ID, worker_id)
+                .set(consts::REQUEST_ID, request_id)
+                .set(consts::SESSION_ID, session_id)
+                .set(consts::SIGNAL, signal)
+                .finish(),
             // HostExecReadComplete is an internal message only sent via mpsc channel, never serialized
             SchedulerMessage::HostExecReadComplete { .. } => {
                 unreachable!("HostExecReadComplete should not be serialized")
@@ -371,6 +401,7 @@ mod consts {
     pub const TYPE_HOST_EXEC_CLOSE_STDIN: &str = "host-exec-close-stdin";
     pub const TYPE_HOST_EXEC_TRY_READ: &str = "host-exec-try-read";
     pub const TYPE_HOST_EXEC_POLL: &str = "host-exec-poll";
+    pub const TYPE_HOST_EXEC_SIGNAL: &str = "host-exec-signal";
     pub const MEMORY: &str = "memory";
     pub const MODULE_HASH: &str = "module-hash";
     pub const MODULE: &str = "module";
@@ -380,4 +411,5 @@ mod consts {
     pub const REQUEST_JSON: &str = "request-json";
     pub const SESSION_ID: &str = "session-id";
     pub const DATA: &str = "data";
+    pub const SIGNAL: &str = "signal";
 }
