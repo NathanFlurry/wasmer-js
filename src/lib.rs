@@ -12,6 +12,7 @@ mod logging;
 mod net;
 mod options;
 mod package_loader;
+pub mod pipes;
 pub mod registry;
 mod run;
 mod runtime;
