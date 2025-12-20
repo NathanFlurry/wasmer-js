@@ -31,10 +31,10 @@ toml = "0.8.14"
 tracing = { version = "0.1", features = ["log", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 url = "2.4.0"
-wasm-bindgen = { version = "=0.2.101" }
-wasm-bindgen-derive = "0.2.1"
-wasm-bindgen-futures = "0.4.40"
-wasm-bindgen-test = "0.3.40"
+wasm-bindgen = { version = "0.2" }
+wasm-bindgen-derive = "0.2"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test = "0.3"
 virtual-fs = { version = "0.601.0", default-features = false }
 virtual-net = { version = "0.601.0", default-features = false, features = [
     "remote",
@@ -44,6 +44,7 @@ wasmer = { version = "6.1.0", default-features = false, features = [
     "js-default",
     "wasm-types-polyfill",
     "enable-serde",
+    "js-serializable-module",
 ] }
 # wasmer-api = { version = "0.601.0" }
 wasmer-config = "0.601.0"
