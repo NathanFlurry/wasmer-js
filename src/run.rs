@@ -7,7 +7,7 @@ use wasmer_wasix::WasiEnvBuilder;
 use wasmer_wasix::runtime::module_cache::HashedModuleData;
 use wasmer_wasix::runners::wasi::{WasiRunner, RuntimeOrEngine};
 
-use crate::{instance::ExitCondition, utils::Error, Instance, RunOptions};
+use crate::{instance::ExitCondition, tasks::ThreadPool, utils::Error, Instance, RunOptions};
 
 const DEFAULT_PROGRAM_NAME: &str = "wasm";
 
@@ -30,9 +30,11 @@ pub async fn run_wasix(wasm_module: WasmModule, config: RunOptions) -> Result<In
 
 #[tracing::instrument(level = "debug", skip_all)]
 async fn run_wasix_inner(wasm_module: WasmModule, config: RunOptions) -> Result<Instance, Error> {
+    // Create a per-command thread pool. The pool is stored in the Instance
+    // and will be dropped (closing the scheduler) when the Instance is dropped.
+    let thread_pool = Arc::new(ThreadPool::new());
     let mut runtime = config.runtime().resolve()?.into_inner();
-    // We set it up with the default pool
-    runtime = Arc::new(runtime.with_default_pool());
+    runtime = Arc::new(runtime.with_task_manager(thread_pool.clone()));
 
     let program_name = config
         .program()
@@ -66,6 +68,7 @@ async fn run_wasix_inner(wasm_module: WasmModule, config: RunOptions) -> Result<
         stderr,
         exit: exit_code_rx,
         fs,
+        _thread_pool: Some(thread_pool),
     })
 }
 

@@ -2,10 +2,12 @@ use anyhow::Context;
 use futures::{channel::oneshot::Receiver, Stream, StreamExt, TryFutureExt};
 use js_sys::Uint8Array;
 use std::path::Path;
+use std::sync::Arc;
 use virtual_fs::{AsyncReadExt, AsyncWriteExt, FileSystem, TmpFileSystem};
 use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsValue};
 use wasmer_wasix::WasiRuntimeError;
 
+use crate::tasks::ThreadPool;
 use crate::utils::Error;
 
 /// A handle connected to a running WASIX program.
@@ -25,6 +27,11 @@ pub struct Instance {
     pub(crate) exit: Receiver<ExitCondition>,
     /// The virtual filesystem for this instance.
     pub(crate) fs: TmpFileSystem,
+    /// The thread pool for this instance. Held here so it stays alive until
+    /// the instance is dropped (after wait() completes and streams are read).
+    /// When dropped, the pool's scheduler is closed and workers are terminated.
+    #[wasm_bindgen(skip)]
+    pub(crate) _thread_pool: Option<Arc<ThreadPool>>,
 }
 
 #[wasm_bindgen]
@@ -186,6 +193,7 @@ impl Instance {
             stderr,
             exit,
             fs: _,
+            _thread_pool,
         } = self;
 
         if let Some(stdin) = stdin {
@@ -216,7 +224,8 @@ impl Instance {
         let stderr_done = copy_to_buffer(crate::streams::read_to_end(stderr), &mut stderr_buffer);
 
         // Note: this relies on the underlying instance closing stdout and
-        // stderr when it exits. Failing to do this will block forever.
+        // stderr when it exits. With Arc+Drop lifecycle, the thread pool stays
+        // alive until this function returns, so streams will close properly.
         let (_, _, ExitCondition(code)) =
             futures::try_join!(stdout_done, stderr_done, exit.map_err(Error::from))?;
 
@@ -226,6 +235,10 @@ impl Instance {
             stdout: stdout_buffer,
             stderr: stderr_buffer,
         };
+
+        // _thread_pool is dropped here when the function returns, which triggers
+        // ThreadPool::drop() -> scheduler.close() -> workers terminated
+        // This is safe because streams are already done reading.
 
         Ok(output)
     }
@@ -433,6 +446,7 @@ mod tests {
             stderr: stderr_stream,
             exit,
             fs: TmpFileSystem::new(),
+            _thread_pool: None,
         };
         dbg!(&instance);
 

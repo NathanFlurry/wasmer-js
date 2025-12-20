@@ -233,10 +233,11 @@ pub struct Command {
 #[wasm_bindgen]
 impl Command {
     pub async fn run(&self, options: Option<SpawnOptions>) -> Result<Instance, Error> {
-        // We set the default pool as it may be not set
-        let thread_pool = Arc::new(ThreadPool::new());
+        // Create a per-command thread pool. The pool is stored in the Instance
+        // and will be dropped (closing the scheduler) when the Instance is dropped,
+        // which happens after wait() completes and all streams are read.
+        let thread_pool = Arc::new(crate::tasks::ThreadPool::new());
         let runtime = Arc::new(self.runtime.with_task_manager(thread_pool.clone()));
-        // let runtime = Arc::new(self.runtime.with_default_pool());
         let pkg = Arc::clone(&self.pkg);
         let tasks = Arc::clone(runtime.task_manager());
 
@@ -255,7 +256,8 @@ impl Command {
         tasks.task_dedicated(Box::new(move || {
             let result = runner.run_command(&command_name, &pkg, RuntimeOrEngine::Runtime(runtime));
             let _ = sender.send(ExitCondition::from_result(result));
-            thread_pool.close();
+            // Don't close the thread pool here - it will be closed when the
+            // Instance is dropped (after wait() and stream reading completes)
         }))?;
 
         Ok(Instance {
@@ -264,6 +266,7 @@ impl Command {
             stderr,
             exit: receiver,
             fs,
+            _thread_pool: Some(thread_pool),
         })
     }
 

@@ -57,7 +57,7 @@ impl ThreadPool {
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         tracing::debug!("Terminating ThreadPool");
-        // self.scheduler.close();
+        self.scheduler.close();
     }
 }
 
