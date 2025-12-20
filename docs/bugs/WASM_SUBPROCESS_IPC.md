@@ -91,6 +91,96 @@ run_wasix()
 | `src/tasks/task_wasm.rs` | SpawnWasm - child WASM execution |
 | `src/tasks/worker_handle.rs` | WorkerHandle - Web Worker management |
 
+## Potential Fixes
+
+### Option 1: Run Parent and Child in Same Worker
+
+**Approach**: Instead of dispatching child WASM to a different Worker, run it in the same Worker as the parent. This keeps tokio channels working since they share memory.
+
+**Implementation**:
+- Modify `task_wasm()` to detect subprocess spawns
+- Execute child synchronously in the same Worker context
+- Parent blocks while child runs
+
+**Pros**:
+- Minimal code changes
+- Tokio channels work as-is
+- No new IPC mechanism needed
+
+**Cons**:
+- **Breaks parallelism completely** - parent cannot do anything while child runs
+- Defeats the purpose of Web Workers
+- Would cause deadlocks if child waits for parent input
+- Subprocess model becomes fundamentally different from native wasmer
+
+**Verdict**: Not recommended. The loss of parallelism is unacceptable.
+
+---
+
+### Option 2: SharedArrayBuffer-Based Pipes (Recommended)
+
+**Approach**: Replace `tokio::sync::mpsc` channels with SharedArrayBuffer + Atomics for pipe communication. The SharedArrayBuffer is shared memory that works across Workers.
+
+**Implementation**:
+- Create new `SharedPipe` type using SharedArrayBuffer ring buffer
+- Use `Atomics.wait()` / `Atomics.notify()` for synchronization
+- Pass SharedArrayBuffer references when spawning child Worker
+- Child and parent both access the same underlying memory
+
+**Pros**:
+- Full parallelism preserved
+- True shared memory - no copying overhead
+- Proper blocking semantics via Atomics
+- Clean abstraction matching existing Pipe API
+
+**Cons**:
+- Requires changes to wasmer core (`lib/virtual-fs`) or wasmer-js wrapper
+- More complex implementation (ring buffer, synchronization)
+- SharedArrayBuffer requires specific security headers in browsers
+
+**Verdict**: Recommended. This is the proper architectural fix that maintains parallelism and performance.
+
+---
+
+### Option 3: Route All Subprocess I/O Through Scheduler
+
+**Approach**: Child writes to a local buffer, sends data via `postMessage` to the scheduler (main thread), which forwards to the parent Worker. Similar to how `host_exec` already works.
+
+**Implementation**:
+- Register parent's pipe handlers with scheduler before spawn
+- Child sends `SchedulerMessage::ChildOutput { child_id, data }` on write
+- Scheduler forwards via `postMessage` to parent Worker
+- Parent receives data through callback, writes to local pipe
+
+**Pros**:
+- Uses existing scheduler infrastructure
+- No changes to wasmer core needed
+- Works without SharedArrayBuffer (browser compatibility)
+
+**Cons**:
+- **All data goes through main thread** - bottleneck for high-throughput
+- Added latency for every write (Worker → Main → Worker)
+- More complex data flow
+- Main thread can become overwhelmed with I/O
+
+**Verdict**: Acceptable fallback if SharedArrayBuffer is unavailable, but not ideal for performance.
+
+---
+
+### Comparison Summary
+
+| Aspect | Option 1: Same Worker | Option 2: SharedArrayBuffer | Option 3: Via Scheduler |
+|--------|----------------------|----------------------------|------------------------|
+| Parallelism | ❌ None | ✅ Full | ✅ Full |
+| Performance | ✅ Fast (no IPC) | ✅ Fast (shared memory) | ⚠️ Slower (postMessage) |
+| Complexity | ✅ Simple | ⚠️ Moderate | ⚠️ Moderate |
+| Core changes | ✅ None | ⚠️ virtual-fs or wrapper | ✅ wasmer-js only |
+| Correctness | ❌ Deadlock risk | ✅ Correct | ✅ Correct |
+
+**Decision**: Proceed with Option 2 (SharedArrayBuffer-based pipes) as it provides the best balance of correctness, performance, and parallelism.
+
+---
+
 ## Existing Cross-Worker IPC
 
 Wasmer-js already has infrastructure for cross-Worker communication:
@@ -200,22 +290,6 @@ Offset  Size   Field
 3. **EOF Signaling**: Need explicit closed flag since channel disconnect doesn't work
 
 4. **Multiple Readers/Writers**: Subprocess stdio is 1:1, so simpler than general-purpose channels
-
-## Alternative Approaches Considered
-
-### Option 1: Same Worker (Rejected)
-
-Run parent and child in same Worker to keep tokio channels working.
-
-**Rejected because**: Defeats the purpose of Web Workers; parent would block while child runs.
-
-### Option 3: Route via Scheduler (Simpler but slower)
-
-All subprocess stdio flows through main thread scheduler using postMessage.
-
-**Considered because**: Uses existing infrastructure, no changes to Pipe internals.
-
-**Not chosen because**: Adds latency, all data goes through main thread bottleneck.
 
 ## Testing
 
