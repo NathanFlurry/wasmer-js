@@ -94,12 +94,14 @@ impl ThreadPoolWorker {
             BlockingJob::SpawnWithModuleAndMemory {
                 module,
                 memory,
-                spawn_wasm,
+                mut spawn_wasm,
                 subprocess_stdio,
             } => {
-                // TODO: If subprocess_stdio is Some, use SharedPipes for child's stdio
-                // instead of the WasiEnv's broken tokio pipes
-                let _subprocess_stdio = subprocess_stdio;
+                // If subprocess_stdio is Some, inject SharedPipes for child's stdio
+                // This replaces the broken tokio pipes with SharedArrayBuffer-based pipes
+                if let Some(ref buffers) = subprocess_stdio {
+                    spawn_wasm.inject_subprocess_stdio(buffers);
+                }
 
                 let task = spawn_wasm.begin().await;
                 let _guard = self.busy();

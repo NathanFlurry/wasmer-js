@@ -17,7 +17,7 @@ use wasmer_wasix::{
     StoreSnapshot, WasiEnv, WasiFunctionEnv, WasiThreadError,
 };
 
-use crate::pipes::SharedStdioPipes;
+use crate::pipes::{SharedPipe, SharedStdioPipes};
 use crate::tasks::post_message_payload::SubprocessStdioBuffers;
 use crate::tasks::SchedulerMessage;
 
@@ -244,6 +244,39 @@ impl SpawnWasm {
             WasmMemoryType::ShareMemory(ty) => Some(ty),
             WasmMemoryType::CreateMemory | WasmMemoryType::CreateMemoryOfType(_) => None,
         }
+    }
+
+    /// Inject subprocess stdio using SharedPipes.
+    ///
+    /// This replaces the child's stdin/stdout/stderr FDs with SharedPipe ends
+    /// that can communicate across Web Workers.
+    ///
+    /// For subprocess spawns:
+    /// - stdout (FD 1): replaced with SharedPipeTx (child writes)
+    /// - stderr (FD 2): replaced with SharedPipeTx (child writes)
+    /// - stdin (FD 0): replaced with SharedPipeRx (child reads)
+    pub(crate) fn inject_subprocess_stdio(&mut self, buffers: &SubprocessStdioBuffers) {
+        // Create SharedPipes from the buffers
+        let stdin_pipe = SharedPipe::from_buffer(buffers.stdin.clone());
+        let stdout_pipe = SharedPipe::from_buffer(buffers.stdout.clone());
+        let stderr_pipe = SharedPipe::from_buffer(buffers.stderr.clone());
+
+        // Split the pipes to get the child-side ends
+        let (_, stdin_rx) = stdin_pipe.split();   // Child reads from stdin
+        let (stdout_tx, _) = stdout_pipe.split(); // Child writes to stdout
+        let (stderr_tx, _) = stderr_pipe.split(); // Child writes to stderr
+
+        // Use the public replace_stdio method on WasiEnv
+        if let Err(e) = self.env.replace_stdio(
+            Some(Box::new(stdin_rx)),
+            Some(Box::new(stdout_tx)),
+            Some(Box::new(stderr_tx)),
+        ) {
+            tracing::error!(?e, "Failed to inject subprocess stdio");
+            return;
+        }
+
+        tracing::debug!("Injected SharedPipe stdio for subprocess");
     }
 
     /// Prepare the WebAssembly task for execution, waiting for any triggers to

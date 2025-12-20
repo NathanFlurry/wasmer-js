@@ -541,6 +541,92 @@ impl AsyncSeek for SharedPipeTx {
     }
 }
 
+// Dummy AsyncRead for SharedPipeTx (write-only pipe cannot be read)
+impl AsyncRead for SharedPipeTx {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Write-only pipe: return error
+        Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidInput, "Write-only pipe cannot be read")))
+    }
+}
+
+// Dummy AsyncWrite for SharedPipeRx (read-only pipe cannot be written)
+impl AsyncWrite for SharedPipeRx {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Read-only pipe: return error
+        Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidInput, "Read-only pipe cannot be written")))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+// Implement VirtualFile for SharedPipeTx (write-only)
+impl VirtualFile for SharedPipeTx {
+    fn last_accessed(&self) -> u64 { 0 }
+    fn last_modified(&self) -> u64 { 0 }
+    fn created_time(&self) -> u64 { 0 }
+    fn size(&self) -> u64 { 0 }
+    fn set_len(&mut self, _new_size: u64) -> virtual_fs::Result<()> { Ok(()) }
+    fn unlink(&mut self) -> Result<(), virtual_fs::FsError> { Ok(()) }
+    fn is_open(&self) -> bool { !self.is_closed() }
+
+    fn poll_read_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        // Write-only pipe cannot be read
+        Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidInput, "Write-only pipe")))
+    }
+
+    fn poll_write_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let free = self.free_space();
+        if free > 0 {
+            Poll::Ready(Ok(free))
+        } else if self.is_closed() {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "Pipe is closed")))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+// Implement VirtualFile for SharedPipeRx (read-only)
+impl VirtualFile for SharedPipeRx {
+    fn last_accessed(&self) -> u64 { 0 }
+    fn last_modified(&self) -> u64 { 0 }
+    fn created_time(&self) -> u64 { 0 }
+    fn size(&self) -> u64 { 0 }
+    fn set_len(&mut self, _new_size: u64) -> virtual_fs::Result<()> { Ok(()) }
+    fn unlink(&mut self) -> Result<(), virtual_fs::FsError> { Ok(()) }
+    fn is_open(&self) -> bool { !self.is_closed() }
+
+    fn poll_read_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let available = self.data_available();
+        if available > 0 {
+            Poll::Ready(Ok(available))
+        } else if self.is_closed() {
+            Poll::Ready(Ok(0))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_write_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        // Read-only pipe cannot be written
+        Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidInput, "Read-only pipe")))
+    }
+}
+
 // Implement VirtualFile for SharedPipe
 
 impl VirtualFile for SharedPipe {
