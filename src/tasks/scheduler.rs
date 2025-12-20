@@ -1,11 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
-    sync::{atomic::{AtomicU32, Ordering}, Mutex},
+    sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Mutex},
 };
 
 use anyhow::{Context, Error};
-use js_sys::{Atomics, Int32Array, Uint8Array};
+use js_sys::{Atomics, SharedArrayBuffer, Uint8Array};
 use once_cell::sync::Lazy;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::{self};
@@ -15,6 +15,8 @@ use wasmer::js::AsJs;
 use wasmer_wasix::runtime::HostExecRequest;
 use wasmer_types::ModuleHash;
 use serde_json;
+
+use crate::pipes::SharedPipe;
 
 use crate::tasks::{
     AsyncJob, BlockingJob, Notification, PostMessagePayload, SchedulerMessage, WorkerHandle,
@@ -74,7 +76,14 @@ thread_local! {
 }
 
 /// Counter for generating unique child IDs within a session.
-static NEXT_CHILD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Counter for generating unique subprocess IDs.
+static NEXT_SUBPROCESS_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Stores subprocess output pipes for polling.
+/// Key is subprocess_id, value is (stdout_pipe, stderr_pipe).
+static SUBPROCESS_OUTPUT_PIPES: Lazy<Mutex<HashMap<u64, (SharedPipe, SharedPipe)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// A handle for interacting with the threadpool's scheduler.
 #[derive(Debug, Clone)]
@@ -247,6 +256,26 @@ impl SchedulerState {
                 spawn_wasm,
                 subprocess_stdio,
             } => {
+                // If subprocess_stdio is present, set up polling for output
+                if let Some(ref buffers) = subprocess_stdio {
+                    let subprocess_id = NEXT_SUBPROCESS_ID.fetch_add(1, Ordering::SeqCst);
+
+                    // Create SharedPipes from the buffers (same buffers as child uses)
+                    // For stdout/stderr, we read from the parent side (child writes, parent reads)
+                    let stdout_pipe = SharedPipe::from_buffer(buffers.stdout.clone());
+                    let stderr_pipe = SharedPipe::from_buffer(buffers.stderr.clone());
+
+                    // Store pipes for polling
+                    SUBPROCESS_OUTPUT_PIPES.lock().unwrap().insert(subprocess_id, (stdout_pipe, stderr_pipe));
+
+                    // Spawn async task to poll subprocess output
+                    wasm_bindgen_futures::spawn_local(async move {
+                        poll_subprocess_output(subprocess_id).await;
+                    });
+
+                    tracing::debug!(subprocess_id, "Started polling subprocess output");
+                }
+
                 let temp_store = wasmer::Store::default();
                 let memory = memory.map(|m| m.as_jsvalue(&temp_store).dyn_into().unwrap());
                 let module = JsValue::from(module).dyn_into().unwrap();
@@ -1108,6 +1137,84 @@ fn create_host_exec_context(request: &HostExecRequest, session_id: u64, schedule
     js_sys::Reflect::set(&obj, &JsValue::from_str("setChildOutputHandlers"), &set_child_handlers.into_js_value()).ok();
 
     obj.into()
+}
+
+/// Poll subprocess output pipes and log to console.
+///
+/// This function is spawned as an async task when a subprocess is started.
+/// It polls the stdout and stderr pipes and outputs any data to console.
+async fn poll_subprocess_output(subprocess_id: u64) {
+    let poll_interval_ms = 50; // Poll every 50ms
+
+    loop {
+        // Get pipes from storage
+        let mut should_remove = false;
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+        let mut pipes_closed = false;
+
+        {
+            let mut pipes_map = SUBPROCESS_OUTPUT_PIPES.lock().unwrap();
+            if let Some((stdout_pipe, stderr_pipe)) = pipes_map.get_mut(&subprocess_id) {
+                // Read from stdout
+                let mut stdout_buf = [0u8; 4096];
+                if let Some(n) = stdout_pipe.try_read(&mut stdout_buf) {
+                    if n > 0 {
+                        stdout_data.extend_from_slice(&stdout_buf[..n]);
+                    }
+                }
+
+                // Read from stderr
+                let mut stderr_buf = [0u8; 4096];
+                if let Some(n) = stderr_pipe.try_read(&mut stderr_buf) {
+                    if n > 0 {
+                        stderr_data.extend_from_slice(&stderr_buf[..n]);
+                    }
+                }
+
+                // Check if both pipes are closed (subprocess exited)
+                if stdout_pipe.is_closed() && stderr_pipe.is_closed() {
+                    pipes_closed = true;
+                    should_remove = true;
+                }
+            } else {
+                // Pipes were removed, exit the loop
+                break;
+            }
+        }
+
+        // Output any data to console (outside the lock)
+        if !stdout_data.is_empty() {
+            if let Ok(text) = String::from_utf8(stdout_data.clone()) {
+                web_sys::console::log_1(&format!("[subprocess {}] stdout: {}", subprocess_id, text).into());
+            } else {
+                web_sys::console::log_1(&format!("[subprocess {}] stdout: {:?}", subprocess_id, stdout_data).into());
+            }
+        }
+
+        if !stderr_data.is_empty() {
+            if let Ok(text) = String::from_utf8(stderr_data.clone()) {
+                web_sys::console::warn_1(&format!("[subprocess {}] stderr: {}", subprocess_id, text).into());
+            } else {
+                web_sys::console::warn_1(&format!("[subprocess {}] stderr: {:?}", subprocess_id, stderr_data).into());
+            }
+        }
+
+        if should_remove {
+            SUBPROCESS_OUTPUT_PIPES.lock().unwrap().remove(&subprocess_id);
+            tracing::debug!(subprocess_id, "Subprocess output polling complete");
+            break;
+        }
+
+        // Wait before next poll
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+            let _ = web_sys::window()
+                .expect("should have window")
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, poll_interval_ms);
+        }))
+        .await
+        .ok();
+    }
 }
 
 #[cfg(test)]
