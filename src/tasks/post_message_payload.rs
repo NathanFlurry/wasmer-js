@@ -1,11 +1,22 @@
 use derivative::Derivative;
-use js_sys::{Uint8Array, WebAssembly};
+use js_sys::{SharedArrayBuffer, Uint8Array, WebAssembly};
 use wasm_bindgen::JsValue;
 use wasmer_types::ModuleHash;
 
 use crate::tasks::{
     interop::Serializer, task_wasm::SpawnWasm, AsyncTask, BlockingModuleTask, BlockingTask,
 };
+
+/// SharedArrayBuffer references for subprocess stdio.
+///
+/// These buffers are created on the parent side and passed to the child
+/// worker. The child uses them to create SharedPipes for stdin/stdout/stderr.
+#[derive(Debug)]
+pub(crate) struct SubprocessStdioBuffers {
+    pub stdin: SharedArrayBuffer,
+    pub stdout: SharedArrayBuffer,
+    pub stderr: SharedArrayBuffer,
+}
 
 /// A message that will be sent from the scheduler to a worker using
 /// `postMessage()`.
@@ -49,6 +60,9 @@ pub(crate) enum BlockingJob {
         /// created.
         memory: Option<WebAssembly::Memory>,
         spawn_wasm: SpawnWasm,
+        /// Optional SharedArrayBuffer pipes for subprocess stdio.
+        /// When present, the child should use these instead of the WasiEnv pipes.
+        subprocess_stdio: Option<SubprocessStdioBuffers>,
     },
 }
 
@@ -84,6 +98,10 @@ mod consts {
     pub(crate) const ERROR: &str = "error";
     pub(crate) const MSG_TYPE: &str = "msg-type";
     pub(crate) const DATA: &str = "data";
+    // Subprocess stdio SharedArrayBuffer keys
+    pub(crate) const SUBPROCESS_STDIN: &str = "subprocess-stdin";
+    pub(crate) const SUBPROCESS_STDOUT: &str = "subprocess-stdout";
+    pub(crate) const SUBPROCESS_STDERR: &str = "subprocess-stderr";
 }
 
 impl PostMessagePayload {
@@ -109,11 +127,23 @@ impl PostMessagePayload {
                 module,
                 memory,
                 spawn_wasm,
-            }) => Serializer::new(consts::TYPE_SPAWN_WITH_MODULE_AND_MEMORY)
-                .boxed(consts::PTR, spawn_wasm)
-                .set(consts::MODULE, module)
-                .set(consts::MEMORY, memory)
-                .finish(),
+                subprocess_stdio,
+            }) => {
+                let mut ser = Serializer::new(consts::TYPE_SPAWN_WITH_MODULE_AND_MEMORY)
+                    .boxed(consts::PTR, spawn_wasm)
+                    .set(consts::MODULE, module)
+                    .set(consts::MEMORY, memory);
+
+                // Add subprocess stdio SharedArrayBuffers if present
+                if let Some(stdio) = subprocess_stdio {
+                    ser = ser
+                        .set(consts::SUBPROCESS_STDIN, stdio.stdin)
+                        .set(consts::SUBPROCESS_STDOUT, stdio.stdout)
+                        .set(consts::SUBPROCESS_STDERR, stdio.stderr);
+                }
+
+                ser.finish()
+            }
             PostMessagePayload::Notification(Notification::CacheModule { hash, module }) => {
                 Serializer::new(consts::TYPE_CACHE_MODULE)
                     .set(consts::MODULE_HASH, hash.to_string())
@@ -191,11 +221,26 @@ impl PostMessagePayload {
                 let memory = de.js(consts::MEMORY).ok();
                 let spawn_wasm = de.boxed(consts::PTR)?;
 
+                // Try to get subprocess stdio SharedArrayBuffers
+                let subprocess_stdio = match (
+                    de.js::<SharedArrayBuffer>(consts::SUBPROCESS_STDIN),
+                    de.js::<SharedArrayBuffer>(consts::SUBPROCESS_STDOUT),
+                    de.js::<SharedArrayBuffer>(consts::SUBPROCESS_STDERR),
+                ) {
+                    (Ok(stdin), Ok(stdout), Ok(stderr)) => Some(SubprocessStdioBuffers {
+                        stdin,
+                        stdout,
+                        stderr,
+                    }),
+                    _ => None,
+                };
+
                 Ok(PostMessagePayload::Blocking(
                     BlockingJob::SpawnWithModuleAndMemory {
                         module,
                         memory,
                         spawn_wasm,
+                        subprocess_stdio,
                     },
                 ))
             }
@@ -380,10 +425,12 @@ mod tests {
                 module,
                 memory,
                 spawn_wasm,
+                subprocess_stdio,
             } => PostMessagePayload::Blocking(BlockingJob::SpawnWithModuleAndMemory {
                 module: module.into(),
                 memory: memory.map(|m| m.as_jsvalue(&wasmer::Store::default()).dyn_into().unwrap()),
                 spawn_wasm,
+                subprocess_stdio,
             }),
             _ => unreachable!(),
         };
@@ -396,6 +443,7 @@ mod tests {
                 module,
                 memory,
                 spawn_wasm,
+                subprocess_stdio: _,
             }) => (module, memory, spawn_wasm),
             _ => unreachable!(),
         };

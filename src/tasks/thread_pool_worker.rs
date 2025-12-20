@@ -95,7 +95,12 @@ impl ThreadPoolWorker {
                 module,
                 memory,
                 spawn_wasm,
+                subprocess_stdio,
             } => {
+                // TODO: If subprocess_stdio is Some, use SharedPipes for child's stdio
+                // instead of the WasiEnv's broken tokio pipes
+                let _subprocess_stdio = subprocess_stdio;
+
                 let task = spawn_wasm.begin().await;
                 let _guard = self.busy();
                 task.execute(module, memory.into()).await?;

@@ -245,6 +245,7 @@ impl SchedulerState {
                 module,
                 memory,
                 spawn_wasm,
+                subprocess_stdio,
             } => {
                 let temp_store = wasmer::Store::default();
                 let memory = memory.map(|m| m.as_jsvalue(&temp_store).dyn_into().unwrap());
@@ -255,6 +256,7 @@ impl SchedulerState {
                         module,
                         memory,
                         spawn_wasm,
+                        subprocess_stdio,
                     },
                 ))
             }

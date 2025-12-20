@@ -113,6 +113,8 @@ pub(crate) enum SchedulerMessage {
         module: wasmer::Module,
         memory: Option<wasmer::Memory>,
         spawn_wasm: SpawnWasm,
+        /// Optional SharedArrayBuffer pipes for subprocess stdio.
+        subprocess_stdio: Option<crate::tasks::post_message_payload::SubprocessStdioBuffers>,
     },
     #[doc(hidden)]
     #[allow(dead_code)]
@@ -185,6 +187,7 @@ impl SchedulerMessage {
                     module,
                     memory,
                     spawn_wasm,
+                    subprocess_stdio: None, // Not received from external sources - scheduler adds this
                 })
             }
             consts::TYPE_HOST_EXEC_START => {
@@ -318,6 +321,7 @@ impl SchedulerMessage {
                 module,
                 memory,
                 spawn_wasm,
+                subprocess_stdio: _, // Not serialized here - scheduler passes this directly to PostMessagePayload
             } => {
                 let mut ser = Serializer::new(consts::TYPE_SPAWN_WITH_MODULE_AND_MEMORY)
                     .set(consts::MODULE, module)

@@ -104,10 +104,13 @@ pub(crate) fn to_scheduler_message(
         store_snapshot,
     };
 
+    // TODO: For subprocess spawns, create SharedPipes here and set subprocess_stdio
+    // For now, always None - will be implemented in subprocess detection phase
     Ok(SchedulerMessage::SpawnWithModuleAndMemory {
         module,
         memory,
         spawn_wasm,
+        subprocess_stdio: None,
     })
 }
 
