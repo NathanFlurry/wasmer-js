@@ -17,6 +17,8 @@ use wasmer_wasix::{
     StoreSnapshot, WasiEnv, WasiFunctionEnv, WasiThreadError,
 };
 
+use crate::pipes::SharedStdioPipes;
+use crate::tasks::post_message_payload::SubprocessStdioBuffers;
 use crate::tasks::SchedulerMessage;
 
 pub(crate) fn to_scheduler_message(
@@ -86,6 +88,27 @@ pub(crate) fn to_scheduler_message(
         }
     });
 
+    // Detect subprocess spawns by checking if PID > 1
+    // PID 1 is the main process; subprocesses spawned via proc_spawn2 get PID > 1
+    let is_subprocess = env.pid().raw() > 1;
+    let subprocess_stdio = if is_subprocess {
+        tracing::debug!(pid = env.pid().raw(), "Detected subprocess spawn, creating SharedPipes for stdio");
+        let stdio_pipes = SharedStdioPipes::new();
+        let (stdin_buf, stdout_buf, stderr_buf) = stdio_pipes.child_buffers();
+
+        // TODO: Store the parent-side pipes somewhere for the scheduler to poll
+        // For now, we just log and drop them (child output will go to the SharedArrayBuffer
+        // but won't be read until scheduler polling is implemented)
+
+        Some(SubprocessStdioBuffers {
+            stdin: stdin_buf,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        })
+    } else {
+        None
+    };
+
     let store_snapshot = globals.clone();
     let spawn_wasm = SpawnWasm {
         trigger: trigger.map(|trigger| WasmRunTrigger {
@@ -104,13 +127,11 @@ pub(crate) fn to_scheduler_message(
         store_snapshot,
     };
 
-    // TODO: For subprocess spawns, create SharedPipes here and set subprocess_stdio
-    // For now, always None - will be implemented in subprocess detection phase
     Ok(SchedulerMessage::SpawnWithModuleAndMemory {
         module,
         memory,
         spawn_wasm,
-        subprocess_stdio: None,
+        subprocess_stdio,
     })
 }
 
