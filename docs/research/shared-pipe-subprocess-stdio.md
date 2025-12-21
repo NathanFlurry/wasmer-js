@@ -233,16 +233,51 @@ unsafe impl Sync for SharedPipe {}
 
 ### Current Limitations
 
-1. **Stdin Not Fully Implemented**: Parent-to-child stdin writing via SharedPipe is set up but not actively used
-2. **Output Goes to Console**: Subprocess stdout/stderr is logged to browser console, not forwarded to parent process
-3. **No Cleanup Signal**: Subprocess exit doesn't explicitly signal pipe closure
+The current implementation only fixes the **child side** of the pipe. The parent process still has broken tokio pipe handles:
+
+```
+Worker A (Parent)              Main Thread (Scheduler)       Worker B (Child)
+┌─────────────────┐           ┌─────────────────┐           ┌─────────────────┐
+│ tokio::mpsc::rx │──X──      │ SharedPipeRx    │◄──────────│ SharedPipeTx    │
+│  (broken!)      │   │       │ (polls output)  │           │  (child writes) │
+└─────────────────┘   │       └────────┬────────┘           └─────────────────┘
+                      │                │
+                      │                ▼
+                      │         Console.log()   <-- output goes here, not to parent
+                      │
+                      └── Parent can't read child output!
+```
+
+Specific limitations:
+
+1. **Output Goes to Console, Not Parent**: The scheduler polls subprocess output and logs to console. The parent process (Worker A) has no way to read the child's output because its original `tokio::mpsc::rx` handles are broken/orphaned. The SharedPipe data goes to the main thread, not back to the parent Worker.
+
+2. **Stdin Not Usable**: While we create a stdin SharedPipe and inject the Rx end into the child, the parent has no way to write to it. The parent's `tokio::mpsc::tx` handle is broken. We'd need to give the parent a SharedPipeTx end instead.
+
+3. **No Cleanup Signal**: Subprocess exit doesn't explicitly signal pipe closure (set the closed flag in the ring buffer).
+
+### Why This Is Hard
+
+The fundamental issue: **we need to fix both ends of the pipe, not just one**.
+
+Currently:
+- Child side: ✅ Gets SharedPipe ends via `inject_subprocess_stdio()`
+- Parent side: ❌ Still has broken tokio handles
+
+To fix parent side, we'd need to:
+1. Intercept the `proc_spawn2` syscall in the parent process
+2. Replace the pipe handles the syscall creates with SharedPipeTx/Rx ends
+3. This requires modifying WASIX runtime internals, not just wasmer-js
+
+The child-side injection is easy because we control when the child Worker starts. The parent-side replacement is harder because pipes are created deep inside the WASIX `proc_spawn2` implementation.
 
 ### Future Improvements
 
-1. **Bidirectional Stdin**: Implement parent writes to child's stdin SharedPipe
-2. **Parent Forwarding**: Instead of console logging, forward child output to parent's original pipe
-3. **Exit Notification**: Signal pipe closure when subprocess exits
-4. **Buffer Backpressure**: Handle full buffer conditions more gracefully
+1. **Parent-Side Pipe Replacement**: Hook into `proc_spawn2` to replace parent's pipe handles with SharedPipe ends. This would enable both stdin writing and stdout/stderr reading from the parent.
+
+2. **Exit Notification**: Set the ring buffer `closed` flag when subprocess exits.
+
+3. **Buffer Backpressure**: Handle full buffer conditions more gracefully (currently may spin or lose data).
 
 ## Files Modified
 
