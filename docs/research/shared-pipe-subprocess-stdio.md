@@ -260,24 +260,53 @@ Specific limitations:
 
 The fundamental issue: **we need to fix both ends of the pipe, not just one**.
 
+When `fd_pipe()` creates a pipe, it creates TWO separate inodes:
+- `inode_tx` with `Kind::PipeTx { tx }` - the write end
+- `inode_rx` with `Kind::PipeRx { rx }` - the read end
+
+These are connected internally via tokio channels. For stdout:
+- Child's FD 1 → `inode_tx` (child writes here)
+- Parent's read_fd → `inode_rx` (parent reads here)
+
 Currently:
-- Child side: ✅ Gets SharedPipe ends via `inject_subprocess_stdio()`
-- Parent side: ❌ Still has broken tokio handles
+- Child side: ✅ Gets SharedPipe ends via `inject_subprocess_stdio()` - replaces FD 0/1/2
+- Parent side: ❌ Still has `inode_rx` with broken tokio handles
 
-To fix parent side, we'd need to:
-1. Intercept the `proc_spawn2` syscall in the parent process
-2. Replace the pipe handles the syscall creates with SharedPipeTx/Rx ends
-3. This requires modifying WASIX runtime internals, not just wasmer-js
+The problem: **we can only see `inode_tx` from the child's FD table, but `inode_rx` is in the parent's FD table**. These are different inodes, and we don't have access to the parent's FD table in `to_scheduler_message`.
 
-The child-side injection is easy because we control when the child Worker starts. The parent-side replacement is harder because pipes are created deep inside the WASIX `proc_spawn2` implementation.
+### Solutions for Parent-Side
+
+We added `Kind::VirtualPipeTx` and `Kind::VirtualPipeRx` variants to wasmer that can hold any `Box<dyn VirtualFile>`. This enables using SharedPipe ends in place of tokio pipes.
+
+**Option 1: Hook fd_pipe** (Recommended)
+
+Override `fd_pipe` in wasmer-js to create SharedPipe-based pipes from the start:
+```rust
+// In wasmer-js fd_pipe override:
+let shared_pipe = SharedPipe::new();
+let (tx, rx) = shared_pipe.split();
+// Create inodes with Kind::VirtualPipeTx and Kind::VirtualPipeRx
+```
+
+This way, both parent and child automatically use SharedPipes.
+
+**Option 2: Find both inodes at spawn time**
+
+Store a reverse mapping from `PipeTx.rx_end` back to its inode, or add bidirectional links between pipe inodes. Then in `to_scheduler_message`, find and replace both inodes.
+
+**Option 3: Add parent context to spawn**
+
+Modify the spawn path to pass the parent's WasiEnv through to `to_scheduler_message`, allowing us to modify the parent's FD table directly.
 
 ### Future Improvements
 
-1. **Parent-Side Pipe Replacement**: Hook into `proc_spawn2` to replace parent's pipe handles with SharedPipe ends. This would enable both stdin writing and stdout/stderr reading from the parent.
+1. **Implement Option 1 (Hook fd_pipe)**: Override fd_pipe syscall to create SharedPipe-based pipes, eliminating the need for post-spawn injection.
 
 2. **Exit Notification**: Set the ring buffer `closed` flag when subprocess exits.
 
 3. **Buffer Backpressure**: Handle full buffer conditions more gracefully (currently may spin or lose data).
+
+4. **Remove console.log polling**: Once parent-side works, remove scheduler polling and let parent read directly.
 
 ## Files Modified
 
@@ -298,6 +327,13 @@ The child-side injection is easy because we control when the child Worker starts
 | File | Changes |
 |------|---------|
 | `lib/wasix/src/state/env.rs` | WasiEnv::replace_stdio method |
+| `lib/wasix/src/fs/fd.rs` | Kind::VirtualPipeTx and Kind::VirtualPipeRx variants |
+| `lib/wasix/src/fs/inode_guard.rs` | Handle VirtualPipe in poll guards |
+| `lib/wasix/src/fs/mod.rs` | VirtualPipe in directory traversal error |
+| `lib/wasix/src/syscalls/wasi/fd_read.rs` | Read from VirtualPipeRx |
+| `lib/wasix/src/syscalls/wasi/fd_write.rs` | Write to VirtualPipeTx |
+| `lib/wasix/src/syscalls/wasi/*.rs` | Various match patterns updated |
+| `lib/wasix/src/syscalls/wasix/*.rs` | Various match patterns updated |
 
 ## Testing
 
