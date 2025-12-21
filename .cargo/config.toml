@@ -6,6 +6,8 @@ target = "wasm32-unknown-unknown"
 runner = ["wasmer", "run"]
 # This is needed so the module is compiled with atomics support (shared memory)
 # We add the `-no-check-features` linker args because otherwise one of the modules fails to link
+# Note: --shared-memory is needed for Node.js support but requires wasm-bindgen compatibility
+# See docs/bugs/nodejs-sharedarraybuffer-bug.md for details
 rustflags = '-Ctarget-feature=+atomics,+bulk-memory -Clink-args=--no-check-features --cfg=web_sys_unstable_apis'
 
 [unstable]
