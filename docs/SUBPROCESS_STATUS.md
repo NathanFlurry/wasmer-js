@@ -11,8 +11,9 @@ This document tracks all known subprocess-related issues in wasmer-js and their 
 | Scheduler Race Condition | **FIXED** | Sequential tests hang after 2-3 runs |
 | Cross-Worker IPC | **FIXED** | Subprocess stdout/stderr not reaching parent |
 | GlobalScope::sleep() in Node.js | **FIXED** | setTimeout fails in Node.js workers |
-| proc_fork BorrowMutError | **UNRESOLVED** | Bash pipes/substitution panic with RefCell error |
-| $() Command Substitution | **UNRESOLVED** | `echo $(cmd)` hangs, but backticks work |
+| proc_fork BorrowMutError | **FIXED** | Bash pipes/substitution panic with RefCell error |
+| Pipe SIGPIPE Error | **UNRESOLVED** | Pipes receive "Broken pipe" signal |
+| Command Substitution | **UNRESOLVED** | Backticks timeout, `$()` returns empty |
 | Bash Exit Code 45 | **UNRESOLVED** | Bash returns 45 instead of expected exit code |
 | Interactive TTY stdout | **WORKAROUND** | stdout hangs unless `stdin: ''` provided |
 
@@ -81,9 +82,7 @@ await pkg.commands["bash"].run({ args: ["-c", "echo `echo works`"] });
 
 ---
 
-## Unresolved Issues
-
-### 4. proc_fork BorrowMutError
+### 4. proc_fork BorrowMutError (FIXED)
 
 **Problem**: When bash attempts to spawn subprocesses (for pipes or command substitution), the WASIX runtime panics with `BorrowMutError` in `thread_local.rs`.
 
@@ -97,46 +96,56 @@ at wasmer_wasix::syscalls::wasix::proc_fork::run
 at wasmer_wasix::syscalls::wasix::proc_fork::proc_fork
 ```
 
-**Root Cause**: The `WasiInstanceHandlesPointer` uses `RefCell` for interior mutability. During `proc_fork`, the code attempts to borrow the RefCell mutably while it's already borrowed (likely by signal handling or another concurrent operation).
+**Root Cause**: The `WasiInstanceHandlesPointer` uses `RefCell` for interior mutability. Multiple functions held `WasiInstanceGuard` (immutable borrow) across calls that could trigger WASM code, which might need `inner_mut()` (mutable borrow).
 
-**Affected Operations**:
-- `echo test | cat` (pipes)
-- `` echo `echo works` `` (backticks)
-- `echo $(echo works)` (command substitution)
+**Fix**: Restructured the following functions to drop the RefCell guard before making WASM calls:
+- `process_signals_internal` in `env.rs` - Extract handler in scoped block
+- `process_signals` in `env.rs` - Extract signals to process in scoped block
+- `process_signals_and_exit` in `env.rs` - Restructure to drop guard before calling `process_signals`
+- `proc_fork` in `proc_fork.rs` - Extract module/spawn_type in scoped block
 
-**Status**: Requires investigation in wasmer-wasix `lib/wasix/src/state/handles/thread_local.rs` and the `proc_fork` implementation.
-
-**Workaround**: Simple `echo hello` commands work. Avoid pipes and command substitution.
+**Commits**: ed0f6965c, a1600f1fb, df1e071be
 
 ---
 
-### 5. $() Command Substitution Hangs
+## Unresolved Issues
 
-**Problem**: `$(command)` syntax hangs indefinitely, while backticks `` `command` `` work correctly.
+### 5. Pipe SIGPIPE Error
 
-**Observations**:
-- Backticks spawn 4 workers and complete successfully
-- `$()` only spawns 3 workers and hangs
-- The subprocess worker is never spawned with `$()`
+**Problem**: Pipes receive "Broken pipe" signal and produce empty stdout.
 
-**Hypothesis**: WASIX bash implements `$()` differently than backticks:
-- Backticks use `posix_spawn()` which works
-- `$()` may use `fork()` which has issues in WASIX
-
-**Status**: Needs investigation in wasix-libc or bash WASIX port.
-
-**Reproduction**:
-```javascript
-// Works:
-await pkg.commands["bash"].run({ args: ["-c", "echo `echo works`"] });
-
-// Hangs:
-await pkg.commands["bash"].run({ args: ["-c", "echo $(echo works)"] });
+**Error**:
+```
+Program recieved termination signal: Broken pipe
 ```
 
+**Observations**:
+- `echo test | cat` returns empty stdout
+- Exit code 45 (signal-related)
+- No BorrowMutError panic (that was fixed)
+- The pipe is created but data doesn't flow properly
+
+**Hypothesis**: The pipe reader (cat) closes or is never properly connected before the writer (echo) finishes.
+
+**Status**: Needs investigation in WASIX pipe/fork implementation.
+
 ---
 
-### 5. Bash Exit Code 45
+### 6. Command Substitution Issues
+
+**Problem**: Command substitution doesn't work reliably.
+
+**Observations**:
+- Backticks (`` `echo works` ``) timeout (no panic, just hangs)
+- `$()` syntax returns empty output with exit code 45
+
+**Hypothesis**: WASIX implements command substitution using fork+pipe which has issues with the pipe SIGPIPE bug above.
+
+**Status**: Likely related to the pipe SIGPIPE issue.
+
+---
+
+### 7. Bash Exit Code 45
 
 **Problem**: Bash returns exit code 45 instead of the expected exit code.
 
@@ -182,9 +191,11 @@ The `tests/integration.test.ts` file includes subprocess tests:
 | Basic quickjs | PASS | exit=0 |
 | Sequential execution (5x) | PASS | Scheduler race fix working |
 | Bash echo | PASS | stdout="hello", exit=45 (known issue) |
-| Bash pipe | FAIL | BorrowMutError in proc_fork |
-| Backticks | FAIL | BorrowMutError in proc_fork |
-| $() substitution | FAIL | Timeout (known issue) |
+| Bash multi-command | PASS | `echo a; echo b` works |
+| Bash file redirect | PASS | `echo x > /tmp/x && cat /tmp/x` works |
+| Bash pipe | FAIL | SIGPIPE - "Broken pipe" signal |
+| Backticks | FAIL | Timeout (no panic) |
+| $() substitution | PASS* | Returns empty with exit=45 |
 
 ### Working Test Cases
 
@@ -205,28 +216,45 @@ const instance = await pkg.commands["bash"].run({
 });
 const output = await instance.wait();
 // output.stdout = "hello\n", output.code = 45
+
+// Multi-command - WORKS
+const instance = await pkg.commands["bash"].run({
+  args: ["-c", "echo a; echo b"],
+  stdin: ''
+});
+// output.stdout = "a\nb\n"
+
+// File redirect with cat - WORKS
+const instance = await pkg.commands["bash"].run({
+  args: ["-c", "echo test > /tmp/x && cat /tmp/x"],
+  stdin: ''
+});
+// output.stdout = "test\n", output.code = 0
 ```
 
 ### Failing Test Cases
 
 ```javascript
-// Bash pipe - FAILS with BorrowMutError
+// Bash pipe - FAILS with SIGPIPE
 const instance = await pkg.commands["bash"].run({
   args: ["-c", "echo test | cat"],
   stdin: ''
 });
+// stderr = "Program recieved termination signal: Broken pipe\n"
+// stdout = ""
 
-// Backticks - FAILS with BorrowMutError
+// Backticks - TIMEOUT (no panic, just hangs)
 const instance = await pkg.commands["bash"].run({
   args: ["-c", "echo `echo works`"],
   stdin: ''
 });
 
-// $() substitution - HANGS
+// $() substitution - Returns empty
 const instance = await pkg.commands["bash"].run({
   args: ["-c", "echo $(echo works)"],
   stdin: ''
 });
+// stdout = "", code = 45
 ```
 
 ---
