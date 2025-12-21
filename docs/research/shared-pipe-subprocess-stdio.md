@@ -229,84 +229,62 @@ unsafe impl Send for SharedPipe {}
 unsafe impl Sync for SharedPipe {}
 ```
 
-## Limitations and Future Work
+## Implementation Status
 
-### Current Limitations
+### Completed: Pipe Factory Approach
 
-The current implementation only fixes the **child side** of the pipe. The parent process still has broken tokio pipe handles:
+The pipe factory approach (Option 1) has been implemented. The wasmer-wasix Runtime trait now includes a `create_pipe()` method that allows runtimes to provide custom pipe implementations.
 
-```
-Worker A (Parent)              Main Thread (Scheduler)       Worker B (Child)
-┌─────────────────┐           ┌─────────────────┐           ┌─────────────────┐
-│ tokio::mpsc::rx │──X──      │ SharedPipeRx    │◄──────────│ SharedPipeTx    │
-│  (broken!)      │   │       │ (polls output)  │           │  (child writes) │
-└─────────────────┘   │       └────────┬────────┘           └─────────────────┘
-                      │                │
-                      │                ▼
-                      │         Console.log()   <-- output goes here, not to parent
-                      │
-                      └── Parent can't read child output!
-```
-
-Specific limitations:
-
-1. **Output Goes to Console, Not Parent**: The scheduler polls subprocess output and logs to console. The parent process (Worker A) has no way to read the child's output because its original `tokio::mpsc::rx` handles are broken/orphaned. The SharedPipe data goes to the main thread, not back to the parent Worker.
-
-2. **Stdin Not Usable**: While we create a stdin SharedPipe and inject the Rx end into the child, the parent has no way to write to it. The parent's `tokio::mpsc::tx` handle is broken. We'd need to give the parent a SharedPipeTx end instead.
-
-3. **No Cleanup Signal**: Subprocess exit doesn't explicitly signal pipe closure (set the closed flag in the ring buffer).
-
-### Why This Is Hard
-
-The fundamental issue: **we need to fix both ends of the pipe, not just one**.
-
-When `fd_pipe()` creates a pipe, it creates TWO separate inodes:
-- `inode_tx` with `Kind::PipeTx { tx }` - the write end
-- `inode_rx` with `Kind::PipeRx { rx }` - the read end
-
-These are connected internally via tokio channels. For stdout:
-- Child's FD 1 → `inode_tx` (child writes here)
-- Parent's read_fd → `inode_rx` (parent reads here)
-
-Currently:
-- Child side: ✅ Gets SharedPipe ends via `inject_subprocess_stdio()` - replaces FD 0/1/2
-- Parent side: ❌ Still has `inode_rx` with broken tokio handles
-
-The problem: **we can only see `inode_tx` from the child's FD table, but `inode_rx` is in the parent's FD table**. These are different inodes, and we don't have access to the parent's FD table in `to_scheduler_message`.
-
-### Solutions for Parent-Side
-
-We added `Kind::VirtualPipeTx` and `Kind::VirtualPipeRx` variants to wasmer that can hold any `Box<dyn VirtualFile>`. This enables using SharedPipe ends in place of tokio pipes.
-
-**Option 1: Hook fd_pipe** (Recommended)
-
-Override `fd_pipe` in wasmer-js to create SharedPipe-based pipes from the start:
 ```rust
-// In wasmer-js fd_pipe override:
-let shared_pipe = SharedPipe::new();
-let (tx, rx) = shared_pipe.split();
-// Create inodes with Kind::VirtualPipeTx and Kind::VirtualPipeRx
+// In wasmer-wasix runtime/mod.rs:
+pub enum CreatedPipe {
+    /// Standard tokio-based pipe (uses mpsc channels internally).
+    Standard { tx: PipeTx, rx: PipeRx },
+    /// Custom VirtualFile-based pipe for cross-Worker IPC.
+    Virtual {
+        tx: Box<dyn VirtualFile + Send + Sync + 'static>,
+        rx: Box<dyn VirtualFile + Send + Sync + 'static>,
+    },
+}
+
+pub trait Runtime {
+    fn create_pipe(&self) -> CreatedPipe {
+        let (tx, rx) = Pipe::new().split();
+        CreatedPipe::Standard { tx, rx }
+    }
+    // ...
+}
 ```
 
-This way, both parent and child automatically use SharedPipes.
+In wasmer-js, the Runtime implementation overrides this to return SharedPipes:
 
-**Option 2: Find both inodes at spawn time**
+```rust
+// In wasmer-js src/runtime.rs:
+impl wasmer_wasix::runtime::Runtime for Runtime {
+    fn create_pipe(&self) -> wasmer_wasix::runtime::CreatedPipe {
+        let pipe = crate::pipes::SharedPipe::new();
+        let (tx, rx) = pipe.split();
+        wasmer_wasix::runtime::CreatedPipe::Virtual {
+            tx: Box::new(tx),
+            rx: Box::new(rx),
+        }
+    }
+}
+```
 
-Store a reverse mapping from `PipeTx.rx_end` back to its inode, or add bidirectional links between pipe inodes. Then in `to_scheduler_message`, find and replace both inodes.
+Both `proc_spawn` and `fd_pipe` now use the runtime's `create_pipe()` method, so all pipes in wasmer-js are SharedArrayBuffer-based from the start. This means:
 
-**Option 3: Add parent context to spawn**
+1. **Parent can read child output**: Both parent and child have SharedPipe ends
+2. **Stdin works**: Parent can write to SharedPipeTx, child reads from SharedPipeRx
+3. **No post-spawn injection needed**: Pipes are correct from creation
 
-Modify the spawn path to pass the parent's WasiEnv through to `to_scheduler_message`, allowing us to modify the parent's FD table directly.
+### Remaining Improvements
 
-### Future Improvements
+1. **Exit Notification**: Set the ring buffer `closed` flag when subprocess exits.
 
-1. **Implement Option 1 (Hook fd_pipe)**: Override fd_pipe syscall to create SharedPipe-based pipes, eliminating the need for post-spawn injection.
+2. **Buffer Backpressure**: Handle full buffer conditions more gracefully (currently may spin or lose data).
 
-2. **Exit Notification**: Set the ring buffer `closed` flag when subprocess exits.
-
-3. **Buffer Backpressure**: Handle full buffer conditions more gracefully (currently may spin or lose data).
-
-4. **Remove console.log polling**: Once parent-side works, remove scheduler polling and let parent read directly.
+3. **Remove console.log polling**: Now that parent-side works, remove scheduler polling and let parent read directly.
 
 ## Files Modified
 
@@ -316,6 +294,7 @@ Modify the spawn path to pass the parent's WasiEnv through to `to_scheduler_mess
 |------|---------|
 | `src/pipes/mod.rs` | New SharedPipe implementation (~750 lines) |
 | `src/lib.rs` | Export pipes module |
+| `src/runtime.rs` | Override create_pipe() to return SharedPipe |
 | `src/tasks/task_wasm.rs` | Subprocess detection, inject_subprocess_stdio |
 | `src/tasks/thread_pool_worker.rs` | Call inject_subprocess_stdio |
 | `src/tasks/scheduler.rs` | Subprocess output polling |
@@ -326,12 +305,16 @@ Modify the spawn path to pass the parent's WasiEnv through to `to_scheduler_mess
 
 | File | Changes |
 |------|---------|
+| `lib/wasix/src/runtime/mod.rs` | CreatedPipe enum, create_pipe() trait method |
+| `lib/wasix/src/lib.rs` | Export CreatedPipe |
 | `lib/wasix/src/state/env.rs` | WasiEnv::replace_stdio method |
 | `lib/wasix/src/fs/fd.rs` | Kind::VirtualPipeTx and Kind::VirtualPipeRx variants |
 | `lib/wasix/src/fs/inode_guard.rs` | Handle VirtualPipe in poll guards |
-| `lib/wasix/src/fs/mod.rs` | VirtualPipe in directory traversal error |
 | `lib/wasix/src/syscalls/wasi/fd_read.rs` | Read from VirtualPipeRx |
 | `lib/wasix/src/syscalls/wasi/fd_write.rs` | Write to VirtualPipeTx |
+| `lib/wasix/src/syscalls/wasix/fd_pipe.rs` | Use runtime.create_pipe() |
+| `lib/wasix/src/syscalls/wasix/proc_spawn.rs` | Use runtime.create_pipe() |
+| `lib/wasix/src/fs/mod.rs` | VirtualPipe in directory traversal error |
 | `lib/wasix/src/syscalls/wasi/*.rs` | Various match patterns updated |
 | `lib/wasix/src/syscalls/wasix/*.rs` | Various match patterns updated |
 

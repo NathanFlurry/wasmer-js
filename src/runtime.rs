@@ -245,6 +245,16 @@ impl wasmer_wasix::runtime::Runtime for Runtime {
     fn host_exec(&self) -> DynHostExecRuntime {
         self.host_exec.clone()
     }
+
+    fn create_pipe(&self) -> wasmer_wasix::runtime::CreatedPipe {
+        // Use SharedArrayBuffer-based pipes for cross-Worker IPC
+        let pipe = crate::pipes::SharedPipe::new();
+        let (tx, rx) = pipe.split();
+        wasmer_wasix::runtime::CreatedPipe::Virtual {
+            tx: Box::new(tx),
+            rx: Box::new(rx),
+        }
+    }
 }
 
 impl TtyBridge for Runtime {
