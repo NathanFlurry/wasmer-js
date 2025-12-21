@@ -18,6 +18,18 @@ pub(crate) struct SubprocessStdioBuffers {
     pub stderr: SharedArrayBuffer,
 }
 
+/// SharedArrayBuffer references for pipes inherited during fork.
+///
+/// When a process forks (e.g., bash creating a pipe with `echo | cat`),
+/// the SharedPipe file descriptors need their SharedArrayBuffers transferred
+/// to the child worker. This struct holds the FD -> SharedArrayBuffer mapping.
+#[derive(Debug, Default)]
+pub(crate) struct ForkPipeBuffers {
+    /// Vec of (fd, is_tx, buffer) tuples
+    /// is_tx = true for write end (VirtualPipeTx), false for read end (VirtualPipeRx)
+    pub buffers: Vec<(u32, bool, SharedArrayBuffer)>,
+}
+
 /// A message that will be sent from the scheduler to a worker using
 /// `postMessage()`.
 #[derive(Debug)]
@@ -63,6 +75,9 @@ pub(crate) enum BlockingJob {
         /// Optional SharedArrayBuffer pipes for subprocess stdio.
         /// When present, the child should use these instead of the WasiEnv pipes.
         subprocess_stdio: Option<SubprocessStdioBuffers>,
+        /// SharedArrayBuffer pipes inherited from parent during fork.
+        /// These are reconnected after the child WasiEnv is set up.
+        fork_pipes: Option<ForkPipeBuffers>,
     },
 }
 
@@ -102,6 +117,11 @@ mod consts {
     pub(crate) const SUBPROCESS_STDIN: &str = "subprocess-stdin";
     pub(crate) const SUBPROCESS_STDOUT: &str = "subprocess-stdout";
     pub(crate) const SUBPROCESS_STDERR: &str = "subprocess-stderr";
+    // Fork pipe SharedArrayBuffer keys
+    pub(crate) const FORK_PIPE_COUNT: &str = "fork-pipe-count";
+    pub(crate) const FORK_PIPE_FD_PREFIX: &str = "fork-pipe-fd-";
+    pub(crate) const FORK_PIPE_IS_TX_PREFIX: &str = "fork-pipe-is-tx-";
+    pub(crate) const FORK_PIPE_BUFFER_PREFIX: &str = "fork-pipe-buffer-";
 }
 
 impl PostMessagePayload {
@@ -128,6 +148,7 @@ impl PostMessagePayload {
                 memory,
                 spawn_wasm,
                 subprocess_stdio,
+                fork_pipes,
             }) => {
                 let mut ser = Serializer::new(consts::TYPE_SPAWN_WITH_MODULE_AND_MEMORY)
                     .boxed(consts::PTR, spawn_wasm)
@@ -140,6 +161,17 @@ impl PostMessagePayload {
                         .set(consts::SUBPROCESS_STDIN, stdio.stdin)
                         .set(consts::SUBPROCESS_STDOUT, stdio.stdout)
                         .set(consts::SUBPROCESS_STDERR, stdio.stderr);
+                }
+
+                // Add fork pipe SharedArrayBuffers if present
+                if let Some(pipes) = fork_pipes {
+                    ser = ser.set(consts::FORK_PIPE_COUNT, pipes.buffers.len() as u32);
+                    for (i, (fd, is_tx, buffer)) in pipes.buffers.into_iter().enumerate() {
+                        ser = ser
+                            .set(&format!("{}{}", consts::FORK_PIPE_FD_PREFIX, i), fd)
+                            .set(&format!("{}{}", consts::FORK_PIPE_IS_TX_PREFIX, i), is_tx)
+                            .set(&format!("{}{}", consts::FORK_PIPE_BUFFER_PREFIX, i), buffer);
+                    }
                 }
 
                 ser.finish()
@@ -235,12 +267,27 @@ impl PostMessagePayload {
                     _ => None,
                 };
 
+                // Try to get fork pipe SharedArrayBuffers
+                let fork_pipes = if let Ok(count) = de.serde::<u32>(consts::FORK_PIPE_COUNT) {
+                    let mut buffers = Vec::with_capacity(count as usize);
+                    for i in 0..count as usize {
+                        let fd: u32 = de.serde(&format!("{}{}", consts::FORK_PIPE_FD_PREFIX, i))?;
+                        let is_tx: bool = de.serde(&format!("{}{}", consts::FORK_PIPE_IS_TX_PREFIX, i))?;
+                        let buffer: SharedArrayBuffer = de.js(&format!("{}{}", consts::FORK_PIPE_BUFFER_PREFIX, i))?;
+                        buffers.push((fd, is_tx, buffer));
+                    }
+                    Some(ForkPipeBuffers { buffers })
+                } else {
+                    None
+                };
+
                 Ok(PostMessagePayload::Blocking(
                     BlockingJob::SpawnWithModuleAndMemory {
                         module,
                         memory,
                         spawn_wasm,
                         subprocess_stdio,
+                        fork_pipes,
                     },
                 ))
             }
@@ -426,11 +473,13 @@ mod tests {
                 memory,
                 spawn_wasm,
                 subprocess_stdio,
+                fork_pipes,
             } => PostMessagePayload::Blocking(BlockingJob::SpawnWithModuleAndMemory {
                 module: module.into(),
                 memory: memory.map(|m| m.as_jsvalue(&wasmer::Store::default()).dyn_into().unwrap()),
                 spawn_wasm,
                 subprocess_stdio,
+                fork_pipes,
             }),
             _ => unreachable!(),
         };
@@ -444,6 +493,7 @@ mod tests {
                 memory,
                 spawn_wasm,
                 subprocess_stdio: _,
+                fork_pipes: _,
             }) => (module, memory, spawn_wasm),
             _ => unreachable!(),
         };

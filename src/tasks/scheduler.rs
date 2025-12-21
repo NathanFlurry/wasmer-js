@@ -298,6 +298,7 @@ impl SchedulerState {
                 memory,
                 spawn_wasm,
                 subprocess_stdio,
+                fork_pipes,
             } => {
                 // If subprocess_stdio is present, set up polling for output
                 if let Some(ref buffers) = subprocess_stdio {
@@ -329,6 +330,7 @@ impl SchedulerState {
                         memory,
                         spawn_wasm,
                         subprocess_stdio,
+                        fork_pipes,
                     },
                 ))
             }

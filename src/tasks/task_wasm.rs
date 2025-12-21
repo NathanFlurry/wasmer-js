@@ -17,6 +17,8 @@ use wasmer_wasix::{
     StoreSnapshot, WasiEnv, WasiFunctionEnv, WasiThreadError,
 };
 
+use crate::pipes::extract_pipe_buffers;
+use crate::tasks::post_message_payload::ForkPipeBuffers;
 use crate::tasks::SchedulerMessage;
 
 pub(crate) fn to_scheduler_message(
@@ -92,6 +94,17 @@ pub(crate) fn to_scheduler_message(
     // - fork: inherits parent's fd_map which contains SharedPipes
     // The SharedPipes use SharedArrayBuffer internally which works across workers.
 
+    // Extract SharedArrayBuffers from any pipe FDs in the WasiEnv.
+    // These need to be explicitly transferred when spawning in a new Worker.
+    let pipe_buffers = extract_pipe_buffers(&env);
+    let fork_pipes = if pipe_buffers.is_empty() {
+        None
+    } else {
+        Some(ForkPipeBuffers {
+            buffers: pipe_buffers.into_vec(),
+        })
+    };
+
     let store_snapshot = globals.clone();
     let spawn_wasm = SpawnWasm {
         trigger: trigger.map(|trigger| WasmRunTrigger {
@@ -115,6 +128,7 @@ pub(crate) fn to_scheduler_message(
         memory,
         spawn_wasm,
         subprocess_stdio: None,
+        fork_pipes,
     })
 }
 
@@ -232,6 +246,24 @@ impl SpawnWasm {
     // Note: inject_subprocess_stdio was removed. Subprocess stdio pipes are now
     // correctly set up from the start via runtime.create_pipe() which returns
     // SharedPipes. These work across Web Workers via SharedArrayBuffer.
+
+    /// Reconnect SharedArrayBuffer pipes after transfer to worker.
+    ///
+    /// When a forked process is sent to a new Worker, the SharedArrayBuffers
+    /// inside the WasiEnv's pipe file descriptors need to be explicitly
+    /// reconnected since they were transferred separately via postMessage.
+    pub(crate) fn reconnect_fork_pipes(&self, fork_pipes: &ForkPipeBuffers) {
+        use crate::pipes::{reconnect_pipe_buffers, PipeBufferMap};
+
+        // Convert ForkPipeBuffers to PipeBufferMap
+        let mut buffer_map = PipeBufferMap::new();
+        for (fd, is_tx, buffer) in fork_pipes.buffers.iter() {
+            buffer_map.buffers.insert(*fd, (*is_tx, buffer.clone()));
+        }
+
+        // Reconnect the buffers in the WasiEnv
+        reconnect_pipe_buffers(&self.env, buffer_map);
+    }
 
     /// Prepare the WebAssembly task for execution, waiting for any triggers to
     /// resolve.

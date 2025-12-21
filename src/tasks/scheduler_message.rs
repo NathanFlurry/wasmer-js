@@ -115,6 +115,8 @@ pub(crate) enum SchedulerMessage {
         spawn_wasm: SpawnWasm,
         /// Optional SharedArrayBuffer pipes for subprocess stdio.
         subprocess_stdio: Option<crate::tasks::post_message_payload::SubprocessStdioBuffers>,
+        /// SharedArrayBuffer pipes inherited from parent during fork.
+        fork_pipes: Option<crate::tasks::post_message_payload::ForkPipeBuffers>,
     },
     #[doc(hidden)]
     #[allow(dead_code)]
@@ -188,6 +190,7 @@ impl SchedulerMessage {
                     memory,
                     spawn_wasm,
                     subprocess_stdio: None, // Not received from external sources - scheduler adds this
+                    fork_pipes: None, // Not received from external sources - scheduler adds this
                 })
             }
             consts::TYPE_HOST_EXEC_START => {
@@ -322,6 +325,7 @@ impl SchedulerMessage {
                 memory,
                 spawn_wasm,
                 subprocess_stdio: _, // Not serialized here - scheduler passes this directly to PostMessagePayload
+                fork_pipes: _, // Not serialized here - scheduler passes this directly to PostMessagePayload
             } => {
                 let mut ser = Serializer::new(consts::TYPE_SPAWN_WITH_MODULE_AND_MEMORY)
                     .set(consts::MODULE, module)

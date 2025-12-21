@@ -96,10 +96,18 @@ impl ThreadPoolWorker {
                 memory,
                 spawn_wasm,
                 subprocess_stdio: _,
+                fork_pipes,
             } => {
                 // Note: We no longer inject subprocess stdio here.
                 // Pipes are already correctly set up via runtime.create_pipe() (SharedPipes)
                 // and SharedArrayBuffer works across workers.
+
+                // If fork_pipes are present, reconnect them before running.
+                // This is needed because SharedArrayBuffers must be explicitly transferred
+                // via postMessage and then reconnected in the child WasiEnv.
+                if let Some(ref pipes) = fork_pipes {
+                    spawn_wasm.reconnect_fork_pipes(pipes);
+                }
 
                 let task = spawn_wasm.begin().await;
                 let _guard = self.busy();

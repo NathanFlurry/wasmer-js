@@ -24,6 +24,9 @@
 //! - Buffer full when (write_pos + 1) % capacity == read_pos
 //! - Buffer empty when write_pos == read_pos
 
+mod extract;
+pub use extract::{extract_pipe_buffers, reconnect_pipe_buffers, PipeBufferMap};
+
 use js_sys::{Atomics, Int32Array, SharedArrayBuffer, Uint8Array};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::pin::Pin;
@@ -97,6 +100,18 @@ impl SharedPipeTx {
     fn uint8_view(&self) -> Uint8Array {
         Uint8Array::new(&self.buffer)
     }
+
+    /// Get the underlying SharedArrayBuffer for cross-Worker transfer.
+    pub fn shared_buffer(&self) -> &SharedArrayBuffer {
+        &self.buffer
+    }
+
+    /// Create from an existing SharedArrayBuffer (for reconnecting after transfer).
+    pub fn from_buffer(buffer: SharedArrayBuffer) -> Self {
+        let size = buffer.byte_length();
+        let data_capacity = (size as usize) - HEADER_SIZE;
+        Self { buffer, data_capacity }
+    }
 }
 
 impl SharedPipeRx {
@@ -110,6 +125,18 @@ impl SharedPipeRx {
     #[inline]
     fn uint8_view(&self) -> Uint8Array {
         Uint8Array::new(&self.buffer)
+    }
+
+    /// Get the underlying SharedArrayBuffer for cross-Worker transfer.
+    pub fn shared_buffer(&self) -> &SharedArrayBuffer {
+        &self.buffer
+    }
+
+    /// Create from an existing SharedArrayBuffer (for reconnecting after transfer).
+    pub fn from_buffer(buffer: SharedArrayBuffer) -> Self {
+        let size = buffer.byte_length();
+        let data_capacity = (size as usize) - HEADER_SIZE;
+        Self { buffer, data_capacity }
     }
 }
 
