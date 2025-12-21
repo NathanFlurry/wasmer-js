@@ -82,17 +82,74 @@ For shell commands and typical subprocess I/O, the latency is acceptable. If hig
 
 ## Starting Point
 
-Checkout commit `d822560` (pre-SharedPipe) and cherry-pick essential fixes:
+Both repos should be reset to a clean state before the SharedArrayBuffer pipe work.
+
+### wasmer-js repo
+
+Base commit: `d822560` (pre-SharedPipe)
 
 ```bash
+cd /home/nathan/misc/wasmer-js
 git checkout -b scheduler-routed-pipes d822560
-git cherry-pick 9d7b627  # Node.js SharedArrayBuffer support (resolve .cargo/config.toml conflict)
-git cherry-pick 83a88ce  # Scheduler race condition fix
 ```
 
-Commits to cherry-pick:
-- `9d7b627`: Adds shared memory linker flags for Node.js Atomics support
-- `83a88ce`: Fixes scheduler race condition where Close was processed before SpawnBlocking
+**Fixes to cherry-pick:**
+
+| Commit | Description | Notes |
+|--------|-------------|-------|
+| `9d7b627` | Node.js SharedArrayBuffer support | Conflict in `.cargo/config.toml` - keep new rustflags |
+| `83a88ce` | Scheduler race condition fix | Adds setTimeout delay before Close |
+
+```bash
+git cherry-pick 9d7b627 --no-commit
+# Resolve .cargo/config.toml conflict: keep the shared memory flags
+git add .cargo/config.toml rust-toolchain.toml
+git commit -m "Cherry-pick: Node.js SharedArrayBuffer support"
+git cherry-pick 83a88ce
+```
+
+### wasmer repo
+
+Base commit: `3189527ee` (release 6.1.0 merge, before our changes)
+
+```bash
+cd /home/nathan/misc/wasmer
+git checkout -b scheduler-routed-pipes 3189527ee
+```
+
+**Fixes to apply (in order):**
+
+| Commit | Description | Still Needed? |
+|--------|-------------|---------------|
+| `6146c63c9` | Add host_exec syscalls | YES - core host_exec |
+| `cbccc46a0` | Export UNSUPPORTED_HOST_EXEC | YES - host_exec |
+| `9fe775447` | Add host_exec_poll and try_read | YES - host_exec |
+| `361504a66` | Add host_exec_signal and TerminalOptions | YES - host_exec |
+| `48a7d3a64` | Add host_exec_child_output syscall | YES - child process IPC |
+| `da6e73d66` | Add Raw variant to HostExecOutput | YES - passthrough messages |
+| `d84bbe7dd` | Add Debug trait to HostExecRuntime | YES - debugging |
+| `b6d048143` | Add WasiEnv::replace_stdio | NO - was for SharedPipe |
+| `f64bae460` | Add Kind::VirtualPipeTx/Rx | NO - was for SharedPipe |
+| `65c9dadd2` | Add Runtime::create_pipe() | YES - but simpler impl |
+| `ed0f6965c` | Fix proc_fork BorrowMutError | YES - real bug fix |
+| `a1600f1fb` | Fix BorrowMutError in proc_fork | YES - real bug fix |
+| `df1e071be` | Fix BorrowMutError in process_signals | YES - real bug fix |
+| `37c2daf2e` | Add WasiEnv::fs() accessor | MAYBE - evaluate if needed |
+
+```bash
+# Cherry-pick host_exec commits (6146c63c9 through d84bbe7dd)
+git cherry-pick 6146c63c9 cbccc46a0 9fe775447 361504a66 48a7d3a64 da6e73d66 d84bbe7dd
+
+# Cherry-pick create_pipe (will need modification for SimplePipe)
+git cherry-pick 65c9dadd2
+
+# Cherry-pick BorrowMutError fixes
+git cherry-pick ed0f6965c a1600f1fb df1e071be
+```
+
+**Commits to SKIP (SharedArrayBuffer-specific):**
+- `b6d048143` - WasiEnv::replace_stdio (not needed)
+- `f64bae460` - Kind::VirtualPipeTx/Rx (not needed)
 
 ## Architecture
 
