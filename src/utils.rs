@@ -45,21 +45,28 @@ impl GlobalScope {
     }
 
     pub fn sleep(&self, milliseconds: i32) -> Promise {
-        Promise::new(&mut |resolve, reject| match self {
-            GlobalScope::Window(window) => {
-                window
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, milliseconds)
-                    .unwrap();
-            }
-            GlobalScope::Worker(worker_global_scope) => {
-                worker_global_scope
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, milliseconds)
-                    .unwrap();
-            }
-            GlobalScope::Other(_) => {
-                let error = js_sys::Error::new("Unable to call setTimeout()");
-                reject.call1(&reject, &error).unwrap();
-            }
+        Promise::new(&mut |resolve, reject| {
+            // Use reflection to call setTimeout on globalThis directly.
+            // This works in both browser and Node.js environments, whereas
+            // web_sys::Window/WorkerGlobalScope APIs don't work in Node.js workers.
+            let global = js_sys::global();
+            let set_timeout = match js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout")) {
+                Ok(f) => f,
+                Err(_) => {
+                    let error = js_sys::Error::new("Unable to find setTimeout()");
+                    reject.call1(&reject, &error).unwrap();
+                    return;
+                }
+            };
+            let set_timeout: js_sys::Function = match set_timeout.dyn_into() {
+                Ok(f) => f,
+                Err(_) => {
+                    let error = js_sys::Error::new("setTimeout is not a function");
+                    reject.call1(&reject, &error).unwrap();
+                    return;
+                }
+            };
+            let _ = set_timeout.call2(&global, &resolve, &JsValue::from_f64(milliseconds as f64));
         })
     }
 

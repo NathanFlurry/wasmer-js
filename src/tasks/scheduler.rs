@@ -185,7 +185,36 @@ impl Scheduler {
     }
 
     pub fn close(&self) {
-        self.channel.send(SchedulerMessage::Close).unwrap();
+        // We need to delay sending Close to the scheduler to allow any
+        // pending postMessage handlers (like SpawnBlocking cleanup) to arrive.
+        // Without this delay, Close would be processed before late-arriving
+        // messages from workers, causing cleanup tasks to never run.
+        //
+        // The issue is:
+        // 1. Worker sends SpawnBlocking via postMessage (async, goes through event loop)
+        // 2. Main thread sends Close directly to channel (sync, bypasses event loop)
+        // 3. Close gets processed before SpawnBlocking arrives
+        //
+        // By using spawn_local and yielding via setTimeout, we allow
+        // the event loop to process pending postMessage handlers first.
+        let channel = self.channel.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            // Yield to the macrotask queue via setTimeout(0).
+            // This allows any pending postMessage handlers to run.
+            // We use js_sys::Reflect to call setTimeout on globalThis, which works
+            // in both browser and Node.js environments.
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                let global = js_sys::global();
+                let set_timeout = js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("setTimeout"))
+                    .expect("setTimeout should exist");
+                let set_timeout: js_sys::Function = set_timeout.into();
+                let _ = set_timeout.call2(&global, &resolve, &wasm_bindgen::JsValue::from_f64(0.0));
+            });
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+
+            // Now send Close - any pending messages should have arrived
+            let _ = channel.send(SchedulerMessage::Close);
+        });
     }
 
     pub fn is_closed(&self) -> bool {
