@@ -16,7 +16,7 @@ use wasmer_wasix::runtime::HostExecRequest;
 use wasmer_types::ModuleHash;
 use serde_json;
 
-use crate::pipes::SharedPipe;
+use crate::pipes::{SharedPipe, init_pipe_pool, create_pipe_pool};
 
 use crate::tasks::{
     AsyncJob, BlockingJob, Notification, PostMessagePayload, SchedulerMessage, WorkerHandle,
@@ -103,6 +103,19 @@ impl Scheduler {
         let sender = unsafe { Scheduler::new(sender, thread_id) };
 
         let mut scheduler = SchedulerState::new(sender.clone());
+
+        // Log cross-origin isolation status
+        let global = js_sys::global();
+        let coi = js_sys::Reflect::get(&global, &JsValue::from_str("crossOriginIsolated"))
+            .ok()
+            .and_then(|v| v.as_bool());
+        web_sys::console::log_1(&format!("[scheduler] crossOriginIsolated: {:?}", coi).into());
+
+        // Initialize the shared pipe pool on the main thread.
+        // This creates the SharedArrayBuffer and stores it in thread-local storage,
+        // which is then accessed by init_message when creating workers.
+        let pipe_pool = create_pipe_pool();
+        init_pipe_pool(pipe_pool);
 
         tracing::debug!(thread_id, "Spinning up the scheduler");
         wasm_bindgen_futures::spawn_local(
@@ -304,10 +317,10 @@ impl SchedulerState {
                 if let Some(ref buffers) = subprocess_stdio {
                     let subprocess_id = NEXT_SUBPROCESS_ID.fetch_add(1, Ordering::SeqCst);
 
-                    // Create SharedPipes from the buffers (same buffers as child uses)
+                    // Create SharedPipes from pool offsets (same buffers as child uses)
                     // For stdout/stderr, we read from the parent side (child writes, parent reads)
-                    let stdout_pipe = SharedPipe::from_buffer(buffers.stdout.clone());
-                    let stderr_pipe = SharedPipe::from_buffer(buffers.stderr.clone());
+                    let stdout_pipe = SharedPipe::from_pool_offset(buffers.stdout_offset, buffers.stdout_size);
+                    let stderr_pipe = SharedPipe::from_pool_offset(buffers.stderr_offset, buffers.stderr_size);
 
                     // Store pipes for polling
                     SUBPROCESS_OUTPUT_PIPES.lock().unwrap().insert(subprocess_id, (stdout_pipe, stderr_pipe));

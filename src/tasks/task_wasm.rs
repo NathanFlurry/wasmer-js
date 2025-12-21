@@ -100,8 +100,10 @@ pub(crate) fn to_scheduler_message(
     let fork_pipes = if pipe_buffers.is_empty() {
         None
     } else {
+        let all_fds_debug = pipe_buffers.all_fds_debug.clone();
         Some(ForkPipeBuffers {
             buffers: pipe_buffers.into_vec(),
+            all_fds_debug,
         })
     };
 
@@ -247,18 +249,19 @@ impl SpawnWasm {
     // correctly set up from the start via runtime.create_pipe() which returns
     // SharedPipes. These work across Web Workers via SharedArrayBuffer.
 
-    /// Reconnect SharedArrayBuffer pipes after transfer to worker.
+    /// Reconnect WASM memory offsets for pipes after transfer to worker.
     ///
-    /// When a forked process is sent to a new Worker, the SharedArrayBuffers
-    /// inside the WasiEnv's pipe file descriptors need to be explicitly
-    /// reconnected since they were transferred separately via postMessage.
+    /// When a forked process is sent to a new Worker, the pipe file descriptors
+    /// need to be reconnected using the same WASM memory offsets as the parent.
+    /// Since WASM linear memory is shared between workers, this just recreates
+    /// the SharedPipeTx/Rx structs with the same memory offsets.
     pub(crate) fn reconnect_fork_pipes(&self, fork_pipes: &ForkPipeBuffers) {
         use crate::pipes::{reconnect_pipe_buffers, PipeBufferMap};
 
         // Convert ForkPipeBuffers to PipeBufferMap
         let mut buffer_map = PipeBufferMap::new();
-        for (fd, is_tx, buffer) in fork_pipes.buffers.iter() {
-            buffer_map.buffers.insert(*fd, (*is_tx, buffer.clone()));
+        for (fd, is_tx, wasm_offset, buffer_size) in fork_pipes.buffers.iter() {
+            buffer_map.buffers.insert(*fd, (*is_tx, *wasm_offset, *buffer_size));
         }
 
         // Reconnect the buffers in the WasiEnv

@@ -5,6 +5,7 @@ use js_sys::{Array, Int32Array, JsString, SharedArrayBuffer, Uint8Array};
 use once_cell::sync::Lazy;
 use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 
+use crate::pipes::pool::get_pipe_pool;
 use crate::tasks::{PostMessagePayload, Scheduler, SchedulerMessage, WorkerMessage};
 
 /// Size of the SharedArrayBuffer for host_exec communication.
@@ -180,6 +181,12 @@ fn init_message(id: u32, host_exec_buffer: &SharedArrayBuffer) -> Result<JsValue
         &msg,
         &JsString::from("hostExecBuffer"),
         host_exec_buffer,
+    )?;
+    // Pass the shared pipe pool for cross-worker pipe communication
+    js_sys::Reflect::set(
+        &msg,
+        &JsString::from("pipePool"),
+        &get_pipe_pool(),
     )?;
 
     Ok(msg.into())

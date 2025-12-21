@@ -1,5 +1,6 @@
 use derivative::Derivative;
 use js_sys::{SharedArrayBuffer, Uint8Array, WebAssembly};
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasmer_types::ModuleHash;
 
@@ -7,27 +8,36 @@ use crate::tasks::{
     interop::Serializer, task_wasm::SpawnWasm, AsyncTask, BlockingModuleTask, BlockingTask,
 };
 
-/// SharedArrayBuffer references for subprocess stdio.
+/// Pool offsets for subprocess stdio.
 ///
-/// These buffers are created on the parent side and passed to the child
-/// worker. The child uses them to create SharedPipes for stdin/stdout/stderr.
+/// These offsets point to SharedPipe buffers in the shared pipe pool.
+/// The pool is a SharedArrayBuffer created on the main thread and shared
+/// with all workers, so pipes work across fork() boundaries.
 #[derive(Debug)]
 pub(crate) struct SubprocessStdioBuffers {
-    pub stdin: SharedArrayBuffer,
-    pub stdout: SharedArrayBuffer,
-    pub stderr: SharedArrayBuffer,
+    pub stdin_offset: u32,
+    pub stdin_size: u32,
+    pub stdout_offset: u32,
+    pub stdout_size: u32,
+    pub stderr_offset: u32,
+    pub stderr_size: u32,
 }
 
-/// SharedArrayBuffer references for pipes inherited during fork.
+/// Pool offsets for pipes inherited during fork.
 ///
 /// When a process forks (e.g., bash creating a pipe with `echo | cat`),
-/// the SharedPipe file descriptors need their SharedArrayBuffers transferred
-/// to the child worker. This struct holds the FD -> SharedArrayBuffer mapping.
+/// the SharedPipe file descriptors need their pool offsets passed
+/// to the child worker. The pipe pool is shared across all workers,
+/// so forked processes can communicate through pipes.
 #[derive(Debug, Default)]
 pub(crate) struct ForkPipeBuffers {
-    /// Vec of (fd, is_tx, buffer) tuples
+    /// Vec of (fd, is_tx, pool_offset, buffer_size) tuples
     /// is_tx = true for write end (VirtualPipeTx), false for read end (VirtualPipeRx)
-    pub buffers: Vec<(u32, bool, SharedArrayBuffer)>,
+    /// pool_offset is the byte offset into the shared pipe pool
+    /// buffer_size is the total size of the buffer including header
+    pub buffers: Vec<(u32, bool, u32, u32)>,
+    /// Debug info: all fds and their kinds
+    pub all_fds_debug: String,
 }
 
 /// A message that will be sent from the scheduler to a worker using
@@ -113,15 +123,19 @@ mod consts {
     pub(crate) const ERROR: &str = "error";
     pub(crate) const MSG_TYPE: &str = "msg-type";
     pub(crate) const DATA: &str = "data";
-    // Subprocess stdio SharedArrayBuffer keys
-    pub(crate) const SUBPROCESS_STDIN: &str = "subprocess-stdin";
-    pub(crate) const SUBPROCESS_STDOUT: &str = "subprocess-stdout";
-    pub(crate) const SUBPROCESS_STDERR: &str = "subprocess-stderr";
-    // Fork pipe SharedArrayBuffer keys
+    // Subprocess stdio WASM memory offset keys
+    pub(crate) const SUBPROCESS_STDIN_OFFSET: &str = "subprocess-stdin-offset";
+    pub(crate) const SUBPROCESS_STDIN_SIZE: &str = "subprocess-stdin-size";
+    pub(crate) const SUBPROCESS_STDOUT_OFFSET: &str = "subprocess-stdout-offset";
+    pub(crate) const SUBPROCESS_STDOUT_SIZE: &str = "subprocess-stdout-size";
+    pub(crate) const SUBPROCESS_STDERR_OFFSET: &str = "subprocess-stderr-offset";
+    pub(crate) const SUBPROCESS_STDERR_SIZE: &str = "subprocess-stderr-size";
+    // Fork pipe WASM memory offset keys
     pub(crate) const FORK_PIPE_COUNT: &str = "fork-pipe-count";
     pub(crate) const FORK_PIPE_FD_PREFIX: &str = "fork-pipe-fd-";
     pub(crate) const FORK_PIPE_IS_TX_PREFIX: &str = "fork-pipe-is-tx-";
-    pub(crate) const FORK_PIPE_BUFFER_PREFIX: &str = "fork-pipe-buffer-";
+    pub(crate) const FORK_PIPE_OFFSET_PREFIX: &str = "fork-pipe-offset-";
+    pub(crate) const FORK_PIPE_SIZE_PREFIX: &str = "fork-pipe-size-";
 }
 
 impl PostMessagePayload {
@@ -155,22 +169,26 @@ impl PostMessagePayload {
                     .set(consts::MODULE, module)
                     .set(consts::MEMORY, memory);
 
-                // Add subprocess stdio SharedArrayBuffers if present
+                // Add subprocess stdio WASM memory offsets if present
                 if let Some(stdio) = subprocess_stdio {
                     ser = ser
-                        .set(consts::SUBPROCESS_STDIN, stdio.stdin)
-                        .set(consts::SUBPROCESS_STDOUT, stdio.stdout)
-                        .set(consts::SUBPROCESS_STDERR, stdio.stderr);
+                        .set(consts::SUBPROCESS_STDIN_OFFSET, stdio.stdin_offset as u32)
+                        .set(consts::SUBPROCESS_STDIN_SIZE, stdio.stdin_size as u32)
+                        .set(consts::SUBPROCESS_STDOUT_OFFSET, stdio.stdout_offset as u32)
+                        .set(consts::SUBPROCESS_STDOUT_SIZE, stdio.stdout_size as u32)
+                        .set(consts::SUBPROCESS_STDERR_OFFSET, stdio.stderr_offset as u32)
+                        .set(consts::SUBPROCESS_STDERR_SIZE, stdio.stderr_size as u32);
                 }
 
-                // Add fork pipe SharedArrayBuffers if present
+                // Add fork pipe WASM memory offsets if present
                 if let Some(pipes) = fork_pipes {
                     ser = ser.set(consts::FORK_PIPE_COUNT, pipes.buffers.len() as u32);
-                    for (i, (fd, is_tx, buffer)) in pipes.buffers.into_iter().enumerate() {
+                    for (i, (fd, is_tx, pool_offset, buffer_size)) in pipes.buffers.into_iter().enumerate() {
                         ser = ser
                             .set(&format!("{}{}", consts::FORK_PIPE_FD_PREFIX, i), fd)
                             .set(&format!("{}{}", consts::FORK_PIPE_IS_TX_PREFIX, i), is_tx)
-                            .set(&format!("{}{}", consts::FORK_PIPE_BUFFER_PREFIX, i), buffer);
+                            .set(&format!("{}{}", consts::FORK_PIPE_OFFSET_PREFIX, i), pool_offset as u32)
+                            .set(&format!("{}{}", consts::FORK_PIPE_SIZE_PREFIX, i), buffer_size as u32);
                     }
                 }
 
@@ -217,7 +235,8 @@ impl PostMessagePayload {
         let de = crate::tasks::interop::Deserializer::new(value);
 
         // Safety: Keep this in sync with PostMessagePayload::to_js()
-        match de.ty()?.as_str() {
+        let msg_type = de.ty()?;
+        match msg_type.as_str() {
             consts::TYPE_SPAWN_ASYNC => {
                 let task = de.boxed(consts::PTR)?;
                 Ok(PostMessagePayload::Async(AsyncJob::Thunk(task)))
@@ -253,30 +272,37 @@ impl PostMessagePayload {
                 let memory = de.js(consts::MEMORY).ok();
                 let spawn_wasm = de.boxed(consts::PTR)?;
 
-                // Try to get subprocess stdio SharedArrayBuffers
+                // Try to get subprocess stdio pool offsets
                 let subprocess_stdio = match (
-                    de.js::<SharedArrayBuffer>(consts::SUBPROCESS_STDIN),
-                    de.js::<SharedArrayBuffer>(consts::SUBPROCESS_STDOUT),
-                    de.js::<SharedArrayBuffer>(consts::SUBPROCESS_STDERR),
+                    de.serde::<u32>(consts::SUBPROCESS_STDIN_OFFSET),
+                    de.serde::<u32>(consts::SUBPROCESS_STDIN_SIZE),
+                    de.serde::<u32>(consts::SUBPROCESS_STDOUT_OFFSET),
+                    de.serde::<u32>(consts::SUBPROCESS_STDOUT_SIZE),
+                    de.serde::<u32>(consts::SUBPROCESS_STDERR_OFFSET),
+                    de.serde::<u32>(consts::SUBPROCESS_STDERR_SIZE),
                 ) {
-                    (Ok(stdin), Ok(stdout), Ok(stderr)) => Some(SubprocessStdioBuffers {
-                        stdin,
-                        stdout,
-                        stderr,
+                    (Ok(stdin_offset), Ok(stdin_size), Ok(stdout_offset), Ok(stdout_size), Ok(stderr_offset), Ok(stderr_size)) => Some(SubprocessStdioBuffers {
+                        stdin_offset,
+                        stdin_size,
+                        stdout_offset,
+                        stdout_size,
+                        stderr_offset,
+                        stderr_size,
                     }),
                     _ => None,
                 };
 
-                // Try to get fork pipe SharedArrayBuffers
+                // Try to get fork pipe pool offsets
                 let fork_pipes = if let Ok(count) = de.serde::<u32>(consts::FORK_PIPE_COUNT) {
                     let mut buffers = Vec::with_capacity(count as usize);
                     for i in 0..count as usize {
                         let fd: u32 = de.serde(&format!("{}{}", consts::FORK_PIPE_FD_PREFIX, i))?;
                         let is_tx: bool = de.serde(&format!("{}{}", consts::FORK_PIPE_IS_TX_PREFIX, i))?;
-                        let buffer: SharedArrayBuffer = de.js(&format!("{}{}", consts::FORK_PIPE_BUFFER_PREFIX, i))?;
-                        buffers.push((fd, is_tx, buffer));
+                        let pool_offset: u32 = de.serde(&format!("{}{}", consts::FORK_PIPE_OFFSET_PREFIX, i))?;
+                        let buffer_size: u32 = de.serde(&format!("{}{}", consts::FORK_PIPE_SIZE_PREFIX, i))?;
+                        buffers.push((fd, is_tx, pool_offset, buffer_size));
                     }
-                    Some(ForkPipeBuffers { buffers })
+                    Some(ForkPipeBuffers { buffers, all_fds_debug: String::new() })
                 } else {
                     None
                 };

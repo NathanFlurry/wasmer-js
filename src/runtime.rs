@@ -367,8 +367,6 @@ impl HostExecRuntime for HostExecImpl {
             session_id: session,
         });
 
-        web_sys::console::warn_1(&format!("[worker] sending HostExecRead request={} session={}", request_id, session).into());
-
         if let Err(e) = msg.emit() {
             let err_msg = format!("Failed to send host_exec_read: {:?}", e);
             return Box::pin(async move { Err(anyhow::anyhow!(err_msg)) });
@@ -392,14 +390,10 @@ impl HostExecRuntime for HostExecImpl {
                 Atomics::store(view, 0, 0)
                     .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
 
-                web_sys::console::warn_1(&format!("[worker] calling Atomics.wait for session={}", session).into());
-
                 // Block until status becomes non-zero (response ready)
                 // This is the key: Atomics.wait() blocks the thread but can be woken by Atomics.notify()
-                let wait_result = Atomics::wait(view, 0, 0)
+                let _wait_result = Atomics::wait(view, 0, 0)
                     .map_err(|e| anyhow::anyhow!("Atomics::wait failed: {:?}", e))?;
-
-                web_sys::console::warn_1(&format!("[worker] Atomics.wait returned: {:?}", wait_result).into());
 
                 // Read the response from the buffer
                 let msg_type = Atomics::load(view, 1)
@@ -408,11 +402,6 @@ impl HostExecRuntime for HostExecImpl {
                     .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))?;
                 let response_session = Atomics::load(view, 3)
                     .map_err(|e| anyhow::anyhow!("Atomics::load failed: {:?}", e))? as u64;
-
-                web_sys::console::warn_1(&format!(
-                    "[worker] read response: msg_type={}, data_len_or_exit={}, session={}",
-                    msg_type, data_len_or_exit_code, response_session
-                ).into());
 
                 // Verify session matches
                 if response_session != session {
@@ -576,10 +565,8 @@ impl HostExecRuntime for HostExecImpl {
                     .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
 
                 // Block until status becomes non-zero (response ready)
-                let wait_result = Atomics::wait(view, 0, 0)
+                let _wait_result = Atomics::wait(view, 0, 0)
                     .map_err(|e| anyhow::anyhow!("Atomics::wait failed: {:?}", e))?;
-
-                web_sys::console::warn_1(&format!("[worker] host_exec_try_read wait returned: {:?}", wait_result).into());
 
                 // Read the response from the buffer
                 // Status: 0 = waiting, 1 = data available, 2 = no data (EAGAIN)

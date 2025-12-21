@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use derivative::Derivative;
-use js_sys::{Uint8Array, WebAssembly};
+use js_sys::{SharedArrayBuffer, Uint8Array, WebAssembly};
 use wasm_bindgen::JsValue;
 use wasmer::js::AsJs;
 use wasmer_types::ModuleHash;
@@ -9,6 +9,7 @@ use wasmer_types::ModuleHash;
 use crate::{
     tasks::{
         interop::{Deserializer, Serializer},
+        post_message_payload::ForkPipeBuffers,
         task_wasm::SpawnWasm,
         AsyncTask, BlockingModuleTask, BlockingTask,
     },
@@ -185,12 +186,27 @@ impl SchedulerMessage {
                     None => None,
                 };
 
+                // Deserialize fork pipe pool offsets if present
+                let fork_pipes = if let Ok(count) = de.serde::<u32>(consts::FORK_PIPE_COUNT) {
+                    let mut buffers = Vec::with_capacity(count as usize);
+                    for i in 0..count as usize {
+                        let fd: u32 = de.serde(&format!("{}{}", consts::FORK_PIPE_FD_PREFIX, i))?;
+                        let is_tx: bool = de.serde(&format!("{}{}", consts::FORK_PIPE_IS_TX_PREFIX, i))?;
+                        let pool_offset: u32 = de.serde(&format!("{}{}", consts::FORK_PIPE_OFFSET_PREFIX, i))?;
+                        let buffer_size: u32 = de.serde(&format!("{}{}", consts::FORK_PIPE_SIZE_PREFIX, i))?;
+                        buffers.push((fd, is_tx, pool_offset, buffer_size));
+                    }
+                    Some(ForkPipeBuffers { buffers, all_fds_debug: String::new() })
+                } else {
+                    None
+                };
+
                 Ok(SchedulerMessage::SpawnWithModuleAndMemory {
                     module,
                     memory,
                     spawn_wasm,
-                    subprocess_stdio: None, // Not received from external sources - scheduler adds this
-                    fork_pipes: None, // Not received from external sources - scheduler adds this
+                    subprocess_stdio: None, // Not serialized - scheduler handles this separately
+                    fork_pipes,
                 })
             }
             consts::TYPE_HOST_EXEC_START => {
@@ -325,7 +341,7 @@ impl SchedulerMessage {
                 memory,
                 spawn_wasm,
                 subprocess_stdio: _, // Not serialized here - scheduler passes this directly to PostMessagePayload
-                fork_pipes: _, // Not serialized here - scheduler passes this directly to PostMessagePayload
+                fork_pipes,
             } => {
                 let mut ser = Serializer::new(consts::TYPE_SPAWN_WITH_MODULE_AND_MEMORY)
                     .set(consts::MODULE, module)
@@ -334,6 +350,22 @@ impl SchedulerMessage {
                 if let Some(memory) = memory {
                     let store = wasmer::Store::default();
                     ser = ser.set(consts::MEMORY, memory.as_jsvalue(&store));
+                }
+
+                // Serialize fork pipe WASM memory offsets
+                if let Some(pipes) = fork_pipes {
+                    ser = ser.set(consts::FORK_PIPE_COUNT, pipes.buffers.len() as u32);
+                    for (i, (fd, is_tx, wasm_offset, buffer_size)) in pipes.buffers.into_iter().enumerate() {
+                        web_sys::console::log_1(&format!(
+                            "[into_js] pipe[{}]: fd={}, is_tx={}, wasm_offset={}, buffer_size={}",
+                            i, fd, is_tx, wasm_offset, buffer_size
+                        ).into());
+                        ser = ser
+                            .set(&format!("{}{}", consts::FORK_PIPE_FD_PREFIX, i), fd)
+                            .set(&format!("{}{}", consts::FORK_PIPE_IS_TX_PREFIX, i), is_tx)
+                            .set(&format!("{}{}", consts::FORK_PIPE_OFFSET_PREFIX, i), wasm_offset as u32)
+                            .set(&format!("{}{}", consts::FORK_PIPE_SIZE_PREFIX, i), buffer_size as u32);
+                    }
                 }
 
                 ser.finish()
@@ -467,4 +499,10 @@ mod consts {
     pub const SIGNAL: &str = "signal";
     pub const CHILD_ID: &str = "child-id";
     pub const MSG_TYPE: &str = "msg-type";
+    // Fork pipe WASM memory offset keys
+    pub const FORK_PIPE_COUNT: &str = "fork-pipe-count";
+    pub const FORK_PIPE_FD_PREFIX: &str = "fork-pipe-fd-";
+    pub const FORK_PIPE_IS_TX_PREFIX: &str = "fork-pipe-is-tx-";
+    pub const FORK_PIPE_OFFSET_PREFIX: &str = "fork-pipe-offset-";
+    pub const FORK_PIPE_SIZE_PREFIX: &str = "fork-pipe-size-";
 }

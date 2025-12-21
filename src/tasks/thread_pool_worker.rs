@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use js_sys::{Int32Array, SharedArrayBuffer};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
+use crate::pipes::init_pipe_pool;
 use crate::tasks::{AsyncJob, BlockingJob, Notification, PostMessagePayload, WorkerMessage};
 
 /// Thread-local storage for the current worker's ID.
@@ -103,8 +104,8 @@ impl ThreadPoolWorker {
                 // and SharedArrayBuffer works across workers.
 
                 // If fork_pipes are present, reconnect them before running.
-                // This is needed because SharedArrayBuffers must be explicitly transferred
-                // via postMessage and then reconnected in the child WasiEnv.
+                // fork_pipes now uses pool offsets instead of SharedArrayBuffers,
+                // so they work correctly across workers (pipe pool is already shared).
                 if let Some(ref pipes) = fork_pipes {
                     spawn_wasm.reconnect_fork_pipes(pipes);
                 }
@@ -122,7 +123,7 @@ impl ThreadPoolWorker {
 #[wasm_bindgen]
 impl ThreadPoolWorker {
     #[wasm_bindgen(constructor)]
-    pub fn new(id: u32, host_exec_buffer: SharedArrayBuffer) -> ThreadPoolWorker {
+    pub fn new(id: u32, host_exec_buffer: SharedArrayBuffer, pipe_pool: SharedArrayBuffer) -> ThreadPoolWorker {
         // Store the worker ID in thread-local storage for use by HostExecImpl
         CURRENT_WORKER_ID.set(Some(id));
 
@@ -136,6 +137,9 @@ impl ThreadPoolWorker {
         HOST_EXEC_INT32_VIEW.with(|view| {
             *view.borrow_mut() = Some(int32_view);
         });
+
+        // Initialize the shared pipe pool for this worker
+        init_pipe_pool(pipe_pool);
 
         ThreadPoolWorker { id }
     }

@@ -51,10 +51,26 @@ impl Deserializer {
         T: JsCast,
     {
         let value = Reflect::get(&self.value, &JsValue::from_str(field)).map_err(Error::js)?;
-        let value = value.dyn_into().map_err(|_| {
+        let value = value.dyn_into().map_err(|original_value| {
+            // Get the actual JS type for debugging
+            let js_typeof = original_value.js_typeof();
+            let is_null = original_value.is_null();
+            let is_undefined = original_value.is_undefined();
+            let is_object = original_value.is_object();
+            let constructor = if is_object {
+                Reflect::get(&original_value, &JsValue::from_str("constructor"))
+                    .ok()
+                    .and_then(|c| Reflect::get(&c, &JsValue::from_str("name")).ok())
+                    .and_then(|n| n.as_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            } else {
+                format!("(null={}, undefined={}, is_object={})", is_null, is_undefined, is_object)
+            };
             anyhow::anyhow!(
-                "The \"{field}\" field isn't a \"{}\"",
-                std::any::type_name::<T>()
+                "The \"{field}\" field isn't a \"{}\". typeof={}, details={}",
+                std::any::type_name::<T>(),
+                js_typeof.as_string().unwrap_or_default(),
+                constructor
             )
         })?;
         Ok(value)
