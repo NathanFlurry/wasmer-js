@@ -320,17 +320,58 @@ Both `proc_spawn` and `fd_pipe` now use the runtime's `create_pipe()` method, so
 
 ## Testing
 
-To test subprocess stdio:
+### Pipe Factory Verification
+
+The pipe factory has been verified to work for basic subprocess operations:
 
 ```javascript
-// In browser with wasmer-js
-const instance = await Wasmer.spawn("bash", {
-    args: ["-c", "echo hello && echo world >&2"]
+// ✓ Works: Basic echo
+const instance = await pkg.commands["bash"].run({
+  args: ["-c", "echo hello"]
 });
-// Should see in console:
-// [subprocess 1] stdout: hello
-// [subprocess 1] stderr: world
+// stdout: "hello\n"
+
+// ✓ Works: Shell pipe
+const instance = await pkg.commands["bash"].run({
+  args: ["-c", "echo test | cat"]
+});
+// stdout: "test\n"
+
+// ✓ Works: Backticks command substitution
+const instance = await pkg.commands["bash"].run({
+  args: ["-c", "echo `echo works`"]
+});
+// stdout: "works\n"
 ```
+
+### Known Issue: $() Command Substitution Hangs
+
+**Status**: Unresolved - requires further investigation
+
+```javascript
+// ❌ HANGS: $() command substitution
+const instance = await pkg.commands["bash"].run({
+  args: ["-c", "echo $(echo works)"]
+});
+// Never completes - hangs indefinitely
+```
+
+**Observations**:
+- Backticks `\`command\`` work correctly (spawns subprocess worker)
+- `$(command)` syntax hangs (subprocess worker never spawned)
+- Worker count: backticks spawn 4 workers, $() only spawns 3
+- This suggests $() uses a different code path in bash that doesn't trigger subprocess spawning
+
+**Hypothesis**:
+The issue appears to be in how WASIX bash implements `$()` vs backticks:
+- Backticks may use `posix_spawn()` which works
+- `$()` may use `fork()` which has issues in WASIX
+
+This is likely a pre-existing issue with WASIX bash, not specific to the pipe factory implementation.
+
+### Exit Code Note
+
+Bash currently returns exit code 45 instead of 0. This is a separate known issue documented elsewhere.
 
 ## References
 
