@@ -47,8 +47,8 @@ use virtual_fs::VirtualFile;
 
 use pool::{allocate_from_pool, get_pool_int32_view, get_pool_uint8_view};
 
-/// Header size in bytes (4 fields * 4 bytes each)
-const HEADER_SIZE: usize = 16;
+/// Header size in bytes (5 fields * 4 bytes each)
+const HEADER_SIZE: usize = 20;
 
 /// Default buffer size (64KB - header = ~64KB data)
 pub const DEFAULT_PIPE_BUFFER_SIZE: u32 = 65536;
@@ -61,6 +61,9 @@ const OFFSET_READ_POS: u32 = 1;
 const OFFSET_CLOSED: u32 = 2;
 /// Offset for notify flag (in i32 units, used with Atomics.wait/notify)
 const OFFSET_NOTIFY: u32 = 3;
+/// Offset for TX reference count (in i32 units)
+/// This tracks how many TX ends exist. Only close when this reaches 0.
+const OFFSET_TX_COUNT: u32 = 4;
 
 /// A SharedArrayBuffer-based pipe for cross-Worker communication.
 ///
@@ -124,17 +127,22 @@ impl SharedPipeTx {
 
     /// Create a SharedPipeTx from a pool offset and size.
     /// Used when reconstructing from fork_pipes on the child worker.
+    /// This increments the TX reference count atomically.
     pub fn from_pool_offset(offset: u32, size: u32) -> Self {
-        SharedPipeTx {
+        let tx = SharedPipeTx {
             pool_offset: offset,
             buffer_size: size,
             data_capacity: size - HEADER_SIZE as u32,
-        }
+        };
+        // Increment TX reference count for this new TX end
+        let int32_view = tx.int32_view();
+        let _ = Atomics::add(&int32_view, OFFSET_TX_COUNT, 1);
+        tx
     }
 
     /// Create an Int32Array view of the header for atomic operations.
     fn int32_view(&self) -> Int32Array {
-        get_pool_int32_view(self.pool_offset, 4).expect("Pipe pool not initialized")
+        get_pool_int32_view(self.pool_offset, 5).expect("Pipe pool not initialized")
     }
 
     /// Create a Uint8Array view of the data portion.
@@ -169,7 +177,7 @@ impl SharedPipeRx {
 
     /// Create an Int32Array view of the header for atomic operations.
     pub(crate) fn int32_view(&self) -> Int32Array {
-        get_pool_int32_view(self.pool_offset, 4).expect("Pipe pool not initialized")
+        get_pool_int32_view(self.pool_offset, 5).expect("Pipe pool not initialized")
     }
 
     /// Create a Uint8Array view of the data portion.
@@ -197,7 +205,7 @@ impl SharedPipe {
             .expect("Failed to allocate from pipe pool - pool exhausted");
 
         // Create an Int32Array view for atomic initialization
-        let int32_view = get_pool_int32_view(pool_offset, 4)
+        let int32_view = get_pool_int32_view(pool_offset, 5)
             .expect("Pipe pool not initialized");
 
         // Initialize header to zeros
@@ -205,6 +213,8 @@ impl SharedPipe {
         let _ = Atomics::store(&int32_view, OFFSET_READ_POS, 0);
         let _ = Atomics::store(&int32_view, OFFSET_CLOSED, 0);
         let _ = Atomics::store(&int32_view, OFFSET_NOTIFY, 0);
+        // TX reference count starts at 1 (for the initial TX end)
+        let _ = Atomics::store(&int32_view, OFFSET_TX_COUNT, 1);
 
         let tx = SharedPipeTx {
             pool_offset,
@@ -328,7 +338,6 @@ impl SharedPipeTx {
 
         let free = self.free_space();
         if free == 0 {
-            // Buffer is full, would need to wait
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Pipe buffer is full",
@@ -399,6 +408,7 @@ impl SharedPipeRx {
     /// Try to read data without blocking.
     pub fn try_read(&mut self, buf: &mut [u8]) -> Option<usize> {
         let available = self.data_available();
+
         if available == 0 {
             if self.is_closed() {
                 return Some(0); // EOF
@@ -462,6 +472,32 @@ impl SharedPipeRx {
         }
     }
 
+}
+
+// Drop implementations to ensure pipe ends are properly closed when dropped.
+// This is critical for cross-worker pipes to avoid hangs.
+
+impl Drop for SharedPipeTx {
+    fn drop(&mut self) {
+        // Atomically decrement TX reference count
+        let int32_view = self.int32_view();
+        let prev_count = Atomics::sub(&int32_view, OFFSET_TX_COUNT, 1)
+            .expect("Atomics::sub failed");
+
+        // Only close if this was the last TX end
+        if prev_count == 1 {
+            self.close();
+        }
+    }
+}
+
+impl Drop for SharedPipeRx {
+    fn drop(&mut self) {
+        // RX drop does NOT close the pipe - that would break TX's ability to write
+        // The TX side is responsible for signaling EOF by closing.
+        // In POSIX, when reader closes, writer gets SIGPIPE. We don't implement
+        // that - instead we just let TX continue writing until it closes.
+    }
 }
 
 // Implement std::io traits for SharedPipe
