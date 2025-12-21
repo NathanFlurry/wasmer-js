@@ -1,58 +1,104 @@
 # Wasmer-JS Scheduler Flakiness
 
-## Status: Under Investigation
+## Status: ROOT CAUSE IDENTIFIED
 
 ## Summary
 
-When running wasmer-js SDK tests sequentially in Node.js, instances intermittently hang during `instance.wait()`. The issue appears after 2-3 successful runs, suggesting a resource exhaustion or scheduler issue.
+When running wasmer-js SDK tests sequentially in Node.js, the 3rd+ instance hangs during `instance.wait()`. The root cause is a **race condition in scheduler shutdown** where `Close` is processed before pending `SpawnBlocking` cleanup callbacks.
 
-## Reproduction
+## Key Finding
 
-```javascript
-import { init, Wasmer } from './dist/node.mjs';
+**Tests work perfectly in separate processes but fail after 2-3 runs in the same process.**
 
-await init();
+```bash
+# This works (5/5 pass):
+for i in 1 2 3 4 5; do node /tmp/single-test.mjs $i; done
 
-// Run same test 3 times - third often hangs
-for (let i = 0; i < 3; i++) {
-  const pkg = await Wasmer.fromRegistry("saghul/quickjs@0.0.3");
-  const instance = await pkg.commands["quickjs"].run({
-    args: ["--eval", "console.log('hi')"],
-  });
-  const output = await instance.wait();  // <-- hangs on 3rd iteration
-  console.log(`Run ${i+1}:`, output.stdout);
+# This fails (hangs on test 3):
+node /tmp/sequential-test.mjs  # runs 5 tests in same process
+```
+
+## Root Cause
+
+### The Race Condition
+
+1. Task runs on worker, completes, and WASI runtime schedules a `SpawnBlocking` cleanup callback
+2. Main thread's `instance.wait()` sees the exit condition and returns
+3. `Instance` is dropped, triggering `ThreadPool::drop()` which calls `scheduler.close()`
+4. `Close` message is sent to scheduler channel
+5. Scheduler's async loop processes `Close` BEFORE the `SpawnBlocking` callback
+6. Cleanup task never runs, leaving dangling state
+7. Next test encounters corrupted/dangling state and hangs
+
+### Evidence from Logs
+
+```
+wasi[1]::main() has exited with ExitCode::0     // Task done
+Sending msg=SpawnBlocking(_)                     // Cleanup scheduled
+...
+Dropping Scheduler                               // Scheduler closes!
+```
+
+The `SpawnBlocking` message is sent AFTER main() exits but the scheduler closes before processing it.
+
+### The Problematic Code
+
+In `scheduler.rs`:
+```rust
+while let Some(msg) = receiver.recv().await {
+    if let SchedulerMessage::Close = msg {
+        break;  // <-- Breaks immediately, pending messages not processed!
+    }
+    scheduler.execute(msg)?;
 }
 ```
 
-## Observations
+## Proposed Fixes
 
-1. **Individual tests pass**: Running single tests in isolation works fine
-2. **Sequential tests fail intermittently**: After 2-3 runs, `instance.wait()` hangs
-3. **Workers spawn correctly**: The deprecation warning shows 3 workers spawn each time
-4. **Pattern is non-deterministic**: Sometimes fails on run 2, sometimes run 3
+### Option 1: Drain pending messages before close
 
-## Likely Causes
+```rust
+SchedulerMessage::Close => {
+    // Process all remaining messages before closing
+    while let Ok(msg) = receiver.try_recv() {
+        if !matches!(msg, SchedulerMessage::Close) {
+            scheduler.execute(msg)?;
+        }
+    }
+    break;
+}
+```
 
-1. **Worker pool exhaustion**: The SDK spawns Web Workers for threading. If workers aren't properly cleaned up between runs, the pool may fill.
+### Option 2: Reference count pending tasks
 
-2. **SharedArrayBuffer memory leak**: With the new shared memory configuration, there may be buffer references that aren't released.
+Track the number of pending tasks and don't allow close until all complete.
 
-3. **Atomics deadlock**: The `Atomics.waitAsync()` used for scheduling could deadlock if the worker it's waiting on never responds.
+### Option 3: Wait for cleanup in Instance::wait()
 
-4. **WASM instance cleanup**: The WASM instance may hold resources that prevent subsequent instances from executing.
+Modify `wait()` to not just wait for exit code but also for a "cleanup complete" signal.
+
+## Workarounds
+
+For now, run tests in separate Node.js processes:
+
+```javascript
+import { spawn } from 'child_process';
+
+async function runIsolated(script) {
+  const child = spawn('node', [script]);
+  await new Promise(resolve => child.on('close', resolve));
+}
+```
 
 ## Environment
 
 - Node.js v24.3.0
 - wasmer-js v0.8.0 (rivet-patches branch)
 - Rust nightly-2024-12-01
-- SharedArrayBuffer enabled via new config
+- SharedArrayBuffer enabled
 
-## Workarounds
+## Related Files
 
-For now, tests should be run with generous timeouts and potentially in separate processes.
-
-## Related
-
-- SharedArrayBuffer fix in `.cargo/config.toml`
-- The `deprecated parameters` warning suggests SDK init is called multiple times
+- `src/tasks/scheduler.rs` - Scheduler close handling (line 220)
+- `src/tasks/thread_pool.rs` - ThreadPool::drop() (line 58)
+- `src/instance.rs` - Instance::wait() (line 189)

@@ -110,6 +110,20 @@ impl Scheduler {
                 while let Some(msg) = receiver.recv().await {
                     tracing::trace!(?msg, "Executing a message");
                     if let SchedulerMessage::Close = msg {
+                        // Drain any remaining messages before closing to avoid
+                        // leaving pending SpawnBlocking callbacks unprocessed.
+                        // This fixes a race condition where cleanup tasks are
+                        // scheduled after the main task completes but before
+                        // Close is processed.
+                        tracing::debug!("Received Close, draining pending messages");
+                        while let Ok(pending_msg) = receiver.try_recv() {
+                            if !matches!(pending_msg, SchedulerMessage::Close) {
+                                tracing::trace!(?pending_msg, "Processing pending message");
+                                if let Err(e) = scheduler.execute(pending_msg) {
+                                    tracing::error!(error = &*e, "Error processing pending message");
+                                }
+                            }
+                        }
                         break;
                     }
                     if let Err(e) = scheduler.execute(msg) {
