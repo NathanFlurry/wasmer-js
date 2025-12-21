@@ -94,6 +94,28 @@ pub(crate) enum SchedulerMessage {
         msg_type: u32,
         data: Vec<u8>,
     },
+    /// Create a new pipe buffer in the scheduler.
+    PipeCreate {
+        pipe_id: u64,
+        worker_id: u32,
+    },
+    /// Write data to a pipe.
+    PipeWrite {
+        pipe_id: u64,
+        worker_id: u32,
+        data: Vec<u8>,
+    },
+    /// Read data from a pipe (worker will block on Atomics.wait).
+    PipeRead {
+        pipe_id: u64,
+        worker_id: u32,
+        max_len: u32,
+    },
+    /// Close a pipe (TX end closed, signals EOF to readers).
+    PipeClose {
+        pipe_id: u64,
+        worker_id: u32,
+    },
     /// Tell all workers to cache a WebAssembly module.
     #[allow(dead_code)]
     CacheModule {
@@ -280,6 +302,29 @@ impl SchedulerMessage {
                     data,
                 })
             }
+            consts::TYPE_PIPE_CREATE => {
+                let pipe_id = de.serde(consts::PIPE_ID)?;
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                Ok(SchedulerMessage::PipeCreate { pipe_id, worker_id })
+            }
+            consts::TYPE_PIPE_WRITE => {
+                let pipe_id = de.serde(consts::PIPE_ID)?;
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let data_array: Uint8Array = de.js(consts::DATA)?;
+                let data = data_array.to_vec();
+                Ok(SchedulerMessage::PipeWrite { pipe_id, worker_id, data })
+            }
+            consts::TYPE_PIPE_READ => {
+                let pipe_id = de.serde(consts::PIPE_ID)?;
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                let max_len = de.serde(consts::MAX_LEN)?;
+                Ok(SchedulerMessage::PipeRead { pipe_id, worker_id, max_len })
+            }
+            consts::TYPE_PIPE_CLOSE => {
+                let pipe_id = de.serde(consts::PIPE_ID)?;
+                let worker_id = de.serde(consts::WORKER_ID)?;
+                Ok(SchedulerMessage::PipeClose { pipe_id, worker_id })
+            }
             other => {
                 tracing::warn!(r#type = other, "Unknown message type");
                 Err(anyhow::anyhow!("Unknown message type, \"{other}\"").into())
@@ -426,6 +471,33 @@ impl SchedulerMessage {
             SchedulerMessage::HostExecReadComplete { .. } => {
                 unreachable!("HostExecReadComplete should not be serialized")
             }
+            SchedulerMessage::PipeCreate { pipe_id, worker_id } => {
+                Serializer::new(consts::TYPE_PIPE_CREATE)
+                    .set(consts::PIPE_ID, pipe_id)
+                    .set(consts::WORKER_ID, worker_id)
+                    .finish()
+            }
+            SchedulerMessage::PipeWrite { pipe_id, worker_id, data } => {
+                let data_array = Uint8Array::from(data.as_slice());
+                Serializer::new(consts::TYPE_PIPE_WRITE)
+                    .set(consts::PIPE_ID, pipe_id)
+                    .set(consts::WORKER_ID, worker_id)
+                    .set(consts::DATA, data_array)
+                    .finish()
+            }
+            SchedulerMessage::PipeRead { pipe_id, worker_id, max_len } => {
+                Serializer::new(consts::TYPE_PIPE_READ)
+                    .set(consts::PIPE_ID, pipe_id)
+                    .set(consts::WORKER_ID, worker_id)
+                    .set(consts::MAX_LEN, max_len)
+                    .finish()
+            }
+            SchedulerMessage::PipeClose { pipe_id, worker_id } => {
+                Serializer::new(consts::TYPE_PIPE_CLOSE)
+                    .set(consts::PIPE_ID, pipe_id)
+                    .set(consts::WORKER_ID, worker_id)
+                    .finish()
+            }
         }
     }
 }
@@ -459,4 +531,10 @@ mod consts {
     pub const SIGNAL: &str = "signal";
     pub const CHILD_ID: &str = "child-id";
     pub const MSG_TYPE: &str = "msg-type";
+    pub const TYPE_PIPE_CREATE: &str = "pipe-create";
+    pub const TYPE_PIPE_WRITE: &str = "pipe-write";
+    pub const TYPE_PIPE_READ: &str = "pipe-read";
+    pub const TYPE_PIPE_CLOSE: &str = "pipe-close";
+    pub const PIPE_ID: &str = "pipe-id";
+    pub const MAX_LEN: &str = "max-len";
 }

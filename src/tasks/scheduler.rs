@@ -76,6 +76,26 @@ thread_local! {
 /// Counter for generating unique child IDs within a session.
 static NEXT_CHILD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Pipe buffer for scheduler-routed pipes.
+struct PipeBuffer {
+    data: VecDeque<u8>,
+    closed: bool,
+    pending_read: Option<(u32, u32)>, // (worker_id, max_len)
+}
+
+impl Default for PipeBuffer {
+    fn default() -> Self {
+        PipeBuffer {
+            data: VecDeque::new(),
+            closed: false,
+            pending_read: None,
+        }
+    }
+}
+
+/// Storage for pipe buffers. Key is pipe_id.
+static PIPE_BUFFERS: Lazy<Mutex<HashMap<u64, PipeBuffer>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 /// A handle for interacting with the threadpool's scheduler.
 #[derive(Debug, Clone)]
 pub(crate) struct Scheduler {
@@ -601,6 +621,67 @@ impl SchedulerState {
 
                 Ok(())
             }
+            SchedulerMessage::PipeCreate { pipe_id, worker_id: _ } => {
+                tracing::debug!(pipe_id, "Creating pipe buffer");
+                PIPE_BUFFERS.lock().unwrap().insert(pipe_id, PipeBuffer::default());
+                Ok(())
+            }
+            SchedulerMessage::PipeWrite { pipe_id, worker_id: _, data } => {
+                tracing::trace!(pipe_id, data_len = data.len(), "Pipe write");
+                let mut buffers = PIPE_BUFFERS.lock().unwrap();
+                if let Some(buffer) = buffers.get_mut(&pipe_id) {
+                    buffer.data.extend(data);
+                    // Check if there's a pending read we can fulfill
+                    if let Some((read_worker_id, max_len)) = buffer.pending_read.take() {
+                        let to_send_len = buffer.data.len().min(max_len as usize);
+                        let to_send: Vec<u8> = buffer.data.drain(..to_send_len).collect();
+                        drop(buffers);
+                        self.send_pipe_read_response(read_worker_id, pipe_id, Some(to_send))?;
+                    }
+                } else {
+                    tracing::warn!(pipe_id, "Pipe buffer not found for write");
+                }
+                Ok(())
+            }
+            SchedulerMessage::PipeRead { pipe_id, worker_id, max_len } => {
+                tracing::trace!(pipe_id, worker_id, max_len, "Pipe read request");
+                let mut buffers = PIPE_BUFFERS.lock().unwrap();
+                if let Some(buffer) = buffers.get_mut(&pipe_id) {
+                    if !buffer.data.is_empty() {
+                        // Data available, send it
+                        let to_send_len = buffer.data.len().min(max_len as usize);
+                        let to_send: Vec<u8> = buffer.data.drain(..to_send_len).collect();
+                        drop(buffers);
+                        self.send_pipe_read_response(worker_id, pipe_id, Some(to_send))?;
+                    } else if buffer.closed {
+                        // No data and pipe is closed, send EOF
+                        drop(buffers);
+                        self.send_pipe_read_response(worker_id, pipe_id, None)?;
+                    } else {
+                        // No data yet, store pending read
+                        buffer.pending_read = Some((worker_id, max_len));
+                    }
+                } else {
+                    // Pipe doesn't exist, send EOF
+                    tracing::warn!(pipe_id, "Pipe buffer not found for read");
+                    drop(buffers);
+                    self.send_pipe_read_response(worker_id, pipe_id, None)?;
+                }
+                Ok(())
+            }
+            SchedulerMessage::PipeClose { pipe_id, worker_id: _ } => {
+                tracing::debug!(pipe_id, "Pipe close");
+                let mut buffers = PIPE_BUFFERS.lock().unwrap();
+                if let Some(buffer) = buffers.get_mut(&pipe_id) {
+                    buffer.closed = true;
+                    // If there's a pending read, send EOF
+                    if let Some((read_worker_id, _)) = buffer.pending_read.take() {
+                        drop(buffers);
+                        self.send_pipe_read_response(read_worker_id, pipe_id, None)?;
+                    }
+                }
+                Ok(())
+            }
             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
         }
     }
@@ -728,6 +809,52 @@ impl SchedulerState {
             }
         }
         Err(anyhow::anyhow!("Worker {} not found", worker_id))
+    }
+
+    fn send_pipe_read_response(&mut self, worker_id: u32, pipe_id: u64, data: Option<Vec<u8>>) -> Result<(), Error> {
+        // Find the worker and send response via SharedArrayBuffer + Atomics
+        for worker in self.idle.iter().chain(self.busy.iter()) {
+            if worker.id() == worker_id {
+                let int32_view = worker.host_exec_int32_view();
+
+                // Buffer layout for pipe reads (same layout as host_exec):
+                //   [0]: status flag (0 = waiting, 1 = data ready, 2 = EOF)
+                //   [1]: data_len
+                //   [64..]: data bytes
+
+                match data {
+                    Some(bytes) => {
+                        // Write data length
+                        Atomics::store(&int32_view, 1, bytes.len() as i32)
+                            .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+
+                        // Write data bytes starting at byte offset 64
+                        let buffer = int32_view.buffer();
+                        let uint8_view = js_sys::Uint8Array::new(&buffer);
+                        for (i, byte) in bytes.iter().enumerate() {
+                            uint8_view.set_index((64 + i) as u32, *byte);
+                        }
+
+                        // Set status to 1 (data ready)
+                        Atomics::store(&int32_view, 0, 1)
+                            .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+                    }
+                    None => {
+                        // EOF - set status to 2
+                        Atomics::store(&int32_view, 0, 2)
+                            .map_err(|e| anyhow::anyhow!("Atomics::store failed: {:?}", e))?;
+                    }
+                }
+
+                // Wake up the worker
+                tracing::trace!(worker_id, pipe_id, "Notifying worker of pipe read response");
+                Atomics::notify(&int32_view, 0)
+                    .map_err(|e| anyhow::anyhow!("Atomics::notify failed: {:?}", e))?;
+
+                return Ok(());
+            }
+        }
+        Err(anyhow::anyhow!("Worker {} not found for pipe read response", worker_id))
     }
 
     fn send_to_worker(&mut self, worker_id: u32, msg: PostMessagePayload) -> Result<(), Error> {

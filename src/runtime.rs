@@ -16,8 +16,8 @@ use wasmer_wasix::{
         module_cache::ThreadLocalCache,
         package_loader::PackageLoader,
         resolver::{BackendSource, PackageSummary, QueryError, Source},
-        DynHostExecRuntime, HostExecOutput, HostExecRequest, HostExecRuntime, HostExecSession,
-        Signal,
+        CreatedPipe, DynHostExecRuntime, HostExecOutput, HostExecRequest, HostExecRuntime,
+        HostExecSession, Signal,
     },
     VirtualTaskManager,
     WasiTtyState,
@@ -244,6 +244,15 @@ impl wasmer_wasix::runtime::Runtime for Runtime {
 
     fn host_exec(&self) -> DynHostExecRuntime {
         self.host_exec.clone()
+    }
+
+    fn create_pipe(&self) -> CreatedPipe {
+        let pipe = crate::pipes::SimplePipe::new();
+        let (tx, rx) = pipe.split();
+        CreatedPipe::Virtual {
+            tx: Box::new(tx),
+            rx: Box::new(rx),
+        }
     }
 }
 
