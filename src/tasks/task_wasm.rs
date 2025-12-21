@@ -17,8 +17,6 @@ use wasmer_wasix::{
     StoreSnapshot, WasiEnv, WasiFunctionEnv, WasiThreadError,
 };
 
-use crate::pipes::{SharedPipe, SharedStdioPipes};
-use crate::tasks::post_message_payload::SubprocessStdioBuffers;
 use crate::tasks::SchedulerMessage;
 
 pub(crate) fn to_scheduler_message(
@@ -88,26 +86,11 @@ pub(crate) fn to_scheduler_message(
         }
     });
 
-    // Detect subprocess spawns by checking if PID > 1
-    // PID 1 is the main process; subprocesses spawned via proc_spawn2 get PID > 1
-    let is_subprocess = env.pid().raw() > 1;
-    let subprocess_stdio = if is_subprocess {
-        tracing::debug!(pid = env.pid().raw(), "Detected subprocess spawn, creating SharedPipes for stdio");
-        let stdio_pipes = SharedStdioPipes::new();
-        let (stdin_buf, stdout_buf, stderr_buf) = stdio_pipes.child_buffers();
-
-        // TODO: Store the parent-side pipes somewhere for the scheduler to poll
-        // For now, we just log and drop them (child output will go to the SharedArrayBuffer
-        // but won't be read until scheduler polling is implemented)
-
-        Some(SubprocessStdioBuffers {
-            stdin: stdin_buf,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
-        })
-    } else {
-        None
-    };
+    // Note: We no longer create new SharedPipes for subprocess stdio here.
+    // The pipes are already correctly set up by:
+    // - proc_spawn: creates SharedPipes via runtime.create_pipe()
+    // - fork: inherits parent's fd_map which contains SharedPipes
+    // The SharedPipes use SharedArrayBuffer internally which works across workers.
 
     let store_snapshot = globals.clone();
     let spawn_wasm = SpawnWasm {
@@ -131,7 +114,7 @@ pub(crate) fn to_scheduler_message(
         module,
         memory,
         spawn_wasm,
-        subprocess_stdio,
+        subprocess_stdio: None,
     })
 }
 
@@ -246,38 +229,9 @@ impl SpawnWasm {
         }
     }
 
-    /// Inject subprocess stdio using SharedPipes.
-    ///
-    /// This replaces the child's stdin/stdout/stderr FDs with SharedPipe ends
-    /// that can communicate across Web Workers.
-    ///
-    /// For subprocess spawns:
-    /// - stdout (FD 1): replaced with SharedPipeTx (child writes)
-    /// - stderr (FD 2): replaced with SharedPipeTx (child writes)
-    /// - stdin (FD 0): replaced with SharedPipeRx (child reads)
-    pub(crate) fn inject_subprocess_stdio(&mut self, buffers: &SubprocessStdioBuffers) {
-        // Create SharedPipes from the buffers
-        let stdin_pipe = SharedPipe::from_buffer(buffers.stdin.clone());
-        let stdout_pipe = SharedPipe::from_buffer(buffers.stdout.clone());
-        let stderr_pipe = SharedPipe::from_buffer(buffers.stderr.clone());
-
-        // Split the pipes to get the child-side ends
-        let (_, stdin_rx) = stdin_pipe.split();   // Child reads from stdin
-        let (stdout_tx, _) = stdout_pipe.split(); // Child writes to stdout
-        let (stderr_tx, _) = stderr_pipe.split(); // Child writes to stderr
-
-        // Use the public replace_stdio method on WasiEnv
-        if let Err(e) = self.env.replace_stdio(
-            Some(Box::new(stdin_rx)),
-            Some(Box::new(stdout_tx)),
-            Some(Box::new(stderr_tx)),
-        ) {
-            tracing::error!(?e, "Failed to inject subprocess stdio");
-            return;
-        }
-
-        tracing::debug!("Injected SharedPipe stdio for subprocess");
-    }
+    // Note: inject_subprocess_stdio was removed. Subprocess stdio pipes are now
+    // correctly set up from the start via runtime.create_pipe() which returns
+    // SharedPipes. These work across Web Workers via SharedArrayBuffer.
 
     /// Prepare the WebAssembly task for execution, waiting for any triggers to
     /// resolve.
