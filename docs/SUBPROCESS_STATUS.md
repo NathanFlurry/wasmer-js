@@ -12,8 +12,8 @@ This document tracks all known subprocess-related issues in wasmer-js and their 
 | Cross-Worker IPC | **FIXED** | Subprocess stdout/stderr not reaching parent |
 | GlobalScope::sleep() in Node.js | **FIXED** | setTimeout fails in Node.js workers |
 | proc_fork BorrowMutError | **FIXED** | Bash pipes/substitution panic with RefCell error |
-| Pipe SIGPIPE Error | **UNRESOLVED** | Pipes receive "Broken pipe" signal |
-| Command Substitution | **UNRESOLVED** | Backticks timeout, `$()` returns empty |
+| Pipe SIGPIPE Error | **FIXED** | Pipes receive "Broken pipe" signal |
+| Command Substitution | **PENDING** | May work now with pipe fix (needs testing) |
 | Bash Exit Code 45 | **UNRESOLVED** | Bash returns 45 instead of expected exit code |
 | Interactive TTY stdout | **WORKAROUND** | stdout hangs unless `stdin: ''` provided |
 
@@ -108,9 +108,7 @@ at wasmer_wasix::syscalls::wasix::proc_fork::proc_fork
 
 ---
 
-## Unresolved Issues
-
-### 5. Pipe SIGPIPE Error
+### 5. Pipe SIGPIPE Error (FIXED)
 
 **Problem**: Pipes receive "Broken pipe" signal and produce empty stdout.
 
@@ -119,17 +117,32 @@ at wasmer_wasix::syscalls::wasix::proc_fork::proc_fork
 Program recieved termination signal: Broken pipe
 ```
 
-**Observations**:
-- `echo test | cat` returns empty stdout
-- Exit code 45 (signal-related)
-- No BorrowMutError panic (that was fixed)
-- The pipe is created but data doesn't flow properly
+**Root Cause**: When bash creates a pipe with `fd_pipe()` and forks child processes (e.g., for `echo test | cat`):
+1. A SharedPipe is created using SharedArrayBuffer (SAB)
+2. When bash forks for child processes, the WasiEnv is cloned and sent to a new Worker
+3. But the SharedArrayBuffer inside the SharedPipe was NOT included in the postMessage transfer list
+4. The child worker had "dead" references to SABs it couldn't access
+5. Any pipe read/write failed, causing SIGPIPE
 
-**Hypothesis**: The pipe reader (cat) closes or is never properly connected before the writer (echo) finishes.
+**Fix**: Explicitly transfer SharedArrayBuffers for pipe file descriptors when spawning:
+- Extract pipe buffers from WasiEnv before spawning (extract.rs)
+- Include them in PostMessagePayload (ForkPipeBuffers type)
+- Reconnect buffers in child worker before execution
 
-**Status**: Needs investigation in WASIX pipe/fork implementation.
+**Files Changed**:
+- `src/pipes/extract.rs` (new) - Extract/reconnect SharedArrayBuffers from pipe FDs
+- `src/pipes/mod.rs` - Export extract module
+- `src/tasks/task_wasm.rs` - Extract pipe buffers before spawn
+- `src/tasks/post_message_payload.rs` - Add ForkPipeBuffers type
+- `src/tasks/scheduler.rs` - Pass fork_pipes through scheduler
+- `src/tasks/scheduler_message.rs` - Add fork_pipes to message
+- `src/tasks/thread_pool_worker.rs` - Reconnect pipes in worker
+
+**Related**: docs/research/wasix-pipe-sigpipe-bug.md
 
 ---
+
+## Unresolved Issues
 
 ### 6. Command Substitution Issues
 
@@ -139,9 +152,9 @@ Program recieved termination signal: Broken pipe
 - Backticks (`` `echo works` ``) timeout (no panic, just hangs)
 - `$()` syntax returns empty output with exit code 45
 
-**Hypothesis**: WASIX implements command substitution using fork+pipe which has issues with the pipe SIGPIPE bug above.
+**Hypothesis**: WASIX implements command substitution using fork+pipe. This was likely caused by the pipe SIGPIPE bug (now fixed).
 
-**Status**: Likely related to the pipe SIGPIPE issue.
+**Status**: PENDING - May work now with the pipe fix. Needs testing.
 
 ---
 
