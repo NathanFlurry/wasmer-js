@@ -78,67 +78,53 @@ Kind::VirtualPipeRx { rx } => InodeValFilePollGuardMode::File(rx.clone()),
 
 **Commit:** `ebf9a024e`
 
-## Remaining Issue: $() Command Substitution
+## Command Substitution Status
 
-### Symptom
+### Nested Backticks: Fixed
 
-`echo $(echo hello)` produces empty output while `` echo `echo hello` `` works correctly.
-
-### Error Message
-
-When running nested backticks (which triggers similar code paths):
+Nested backticks previously failed with:
 ```
 bash: command_substitute: cannot duplicate pipe as fd 1: Invalid argument
 ```
 
-### Investigation Findings (2024-12-21)
+**Root cause**: When `fd_renumber(pipe_fd, 1)` was called in a nested subprocess, `flush()` returned `Errno::Inval` because stdout had been replaced with a VirtualPipe.
 
-Detailed syscall tracing revealed:
+**Fix (commit `57f0d76b5`)**: Modified `flush()` to handle `FsError::NotAFile` for stdio fds, since pipes don't require explicit flushing.
 
-**For backticks (works):**
-- `fd_pipe` syscall is called - pipe fds created
-- `proc_fork` syscall is called - subprocess spawned
-- Pipe I/O operations occur through scheduler
-- Output captured successfully
+### $() Substitution: Not Yet Fixed
 
-**For $() (fails):**
-- `fd_pipe` is **NOT called**
-- `proc_fork` is **NOT called**
-- No pipe operations occur
-- bash exits silently with no output
+`echo $(echo hello)` produces empty output while backticks work correctly.
 
-**What works vs what fails:**
+**Root cause**: The `sharrattj/bash` package was compiled with `HAVE_DEV_FD` enabled. Bash uses `/dev/fd/<n>` to pass file descriptors for `$()` substitution. WASIX does not provide `/dev/fd`, so bash silently fails.
+
+**Evidence**:
+```bash
+ls -la /dev/fd 2>&1
+# ls: cannot access '/dev/fd': No such file or directory
+```
+
+**Solutions**:
+1. Add virtual `/dev/fd` support to WASIX
+2. Rebuild bash without `HAVE_DEV_FD` (bash falls back to named pipes)
+
+### What Works vs What Fails
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `` `cmd` `` (simple backticks) | ✅ Works | Uses older bash code path |
-| `$(cmd)` | ❌ Fails | bash doesn't call pipe/fork |
-| `` `echo \`nested\`` `` | ❌ Fails | Same error as $() |
+| `` `echo \`nested\`` `` | ✅ Works | Fixed in commit `57f0d76b5` |
+| `$(cmd)` | ❌ Fails | Requires `/dev/fd` |
 | `(subshell)` | ✅ Works | No pipe capture needed |
 | `$((1+1))` | ✅ Works | Arithmetic, no fork needed |
 | `echo | cat` | ✅ Works | Shell-level piping works |
 
-### Root Cause Hypothesis
-
-The issue appears to be in bash's internal handling of $() command substitution. When bash encounters $(), it uses a different code path than backticks that:
-1. Checks for some system capability or feature
-2. This check fails silently in WASIX/wasmer-js
-3. Bash skips the entire command substitution without error
-
-This is **NOT** a wasmer-js scheduler-routed pipes issue - the pipes work correctly for backticks and shell pipelines. It's a bash-WASIX compatibility issue.
-
 ### Fixes Applied
 
-**VirtualPipe Poll Guard Support (commit `ebf9a024e`):**
-Added VirtualPipeTx and VirtualPipeRx handling to `InodeValFilePollGuard::new()` in wasmer-wasix. Previously, polling on VirtualPipe fds would return `Errno::Badf`.
+**1. VirtualPipe Poll Guard Support (commit `ebf9a024e`):**
+Added VirtualPipeTx and VirtualPipeRx handling to `InodeValFilePollGuard::new()`.
 
-This fix enables proper poll_oneoff support for scheduler-routed pipes, though it didn't resolve the $() issue (since $() fails before creating pipes).
-
-### Future Investigation
-
-The $() issue requires investigation at the bash-WASIX interface level:
-1. Trace bash's internal command_substitute() function behavior
-2. Check what system call or check bash makes before creating the pipe for $()
-3. May require changes to the bash WASM package or wasix-libc
+**2. Flush VirtualPipe on Stdio (commit `57f0d76b5`):**
+Modified `flush()` to handle non-File types on stdio fds gracefully.
 
 ## Architecture
 
