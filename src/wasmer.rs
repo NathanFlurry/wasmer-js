@@ -387,13 +387,22 @@ pub(crate) async fn configure_runner(
     }
 }
 
+#[allow(unreachable_code)]
 fn setup_tty(options: &SpawnOptions, tty_options: TtyOptions) -> TerminalMode {
-    // Handle the simple (non-interactive) case first.
-    if let Some(stdin) = options.read_stdin() {
-        return TerminalMode::NonInteractive {
-            stdin: virtual_fs::StaticFile::new(stdin),
-        };
-    }
+    // Use non-interactive mode for all cases. Interactive mode has a race condition
+    // where the TTY's stdin read may not see EOF reliably when the stdin
+    // WritableStream is closed, causing stdout to never complete.
+    //
+    // When stdin is provided, use it. When not provided, use empty stdin.
+    let stdin_data = options.read_stdin().unwrap_or_default();
+    tracing::debug!("Using NonInteractive mode (stdin {} bytes)", stdin_data.len());
+    return TerminalMode::NonInteractive {
+        stdin: virtual_fs::StaticFile::new(stdin_data),
+    };
+
+    // The Interactive TTY code below is disabled due to the race condition.
+    // When fixed, the Interactive mode can be re-enabled for cases where
+    // interactive stdin is actually needed.
 
     let (stdout_pipe, stdout_stream) = crate::streams::output_pipe();
 
