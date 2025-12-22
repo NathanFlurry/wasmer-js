@@ -6,7 +6,7 @@ This document tracks the implementation status of scheduler-routed pipes for was
 
 ## Current Status: Mostly Working
 
-**Date:** 2024-12-21
+**Date:** 2025-12-21
 
 ### Test Results
 
@@ -19,7 +19,7 @@ This document tracks the implementation status of scheduler-routed pipes for was
 | Sequential && | `echo a && echo b` | ✅ PASS | |
 | Sequential ; | `echo c; echo d` | ✅ PASS | |
 | Backticks | `` echo `echo hello` `` | ✅ PASS | |
-| $() substitution | `echo $(echo world)` | ❌ FAIL | WASIX dup2 issue |
+| $() substitution | `echo $(echo world)` | ❌ FAIL | bash-WASIX compatibility |
 | Write and cat | `echo test > /tmp/f.txt && cat /tmp/f.txt` | ✅ PASS | |
 | Env var | `X=hello; echo $X` | ✅ PASS | |
 
@@ -64,6 +64,20 @@ Added console logging for debugging pipe and subprocess issues:
 
 **Commit:** `69f2751`
 
+### 3. VirtualPipe Poll Guard Support (Fixed)
+
+**Problem:** Polling on VirtualPipe file descriptors via poll_oneoff would return `Errno::Badf`.
+
+**Root Cause:** `InodeValFilePollGuard::new()` didn't handle `Kind::VirtualPipeTx` and `Kind::VirtualPipeRx`, causing it to return `None` for these fd types.
+
+**Fix:** Added VirtualPipe handling by mapping them to the File poll guard mode:
+```rust
+Kind::VirtualPipeTx { tx } => InodeValFilePollGuardMode::File(tx.clone()),
+Kind::VirtualPipeRx { rx } => InodeValFilePollGuardMode::File(rx.clone()),
+```
+
+**Commit:** `ebf9a024e`
+
 ## Remaining Issue: $() Command Substitution
 
 ### Symptom
@@ -77,28 +91,54 @@ When running nested backticks (which triggers similar code paths):
 bash: command_substitute: cannot duplicate pipe as fd 1: Invalid argument
 ```
 
-### Root Cause Analysis
+### Investigation Findings (2024-12-21)
 
-The error indicates that bash's internal `dup2()` call is failing when setting up file descriptors for command substitution. Specifically:
-- bash tries to duplicate a pipe fd to fd 1 (stdout)
-- WASIX returns EINVAL (Invalid argument)
+Detailed syscall tracing revealed:
 
-This is a WASIX-level issue, not a scheduler-routed pipes issue. The pipe I/O itself works correctly (as proven by `echo test | cat` working), but the file descriptor duplication syscall is failing.
+**For backticks (works):**
+- `fd_pipe` syscall is called - pipe fds created
+- `proc_fork` syscall is called - subprocess spawned
+- Pipe I/O operations occur through scheduler
+- Output captured successfully
 
-### Difference Between $() and Backticks
+**For $() (fails):**
+- `fd_pipe` is **NOT called**
+- `proc_fork` is **NOT called**
+- No pipe operations occur
+- bash exits silently with no output
 
-While both should be equivalent in bash, they may use different internal mechanisms:
-- Backticks: Older mechanism, simpler pipe setup
-- `$()`: Newer mechanism, may use more complex fd manipulation
+**What works vs what fails:**
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `` `cmd` `` (simple backticks) | ✅ Works | Uses older bash code path |
+| `$(cmd)` | ❌ Fails | bash doesn't call pipe/fork |
+| `` `echo \`nested\`` `` | ❌ Fails | Same error as $() |
+| `(subshell)` | ✅ Works | No pipe capture needed |
+| `$((1+1))` | ✅ Works | Arithmetic, no fork needed |
+| `echo | cat` | ✅ Works | Shell-level piping works |
 
-Simple backticks work, but `$()` and nested backticks fail, suggesting the issue is with specific fd duplication patterns.
+### Root Cause Hypothesis
 
-### Investigation Path
+The issue appears to be in bash's internal handling of $() command substitution. When bash encounters $(), it uses a different code path than backticks that:
+1. Checks for some system capability or feature
+2. This check fails silently in WASIX/wasmer-js
+3. Bash skips the entire command substitution without error
 
-1. Check WASIX `fd_dup` / `fd_dup2` implementation in wasmer-wasix
-2. Trace which syscall is failing and with what arguments
-3. Compare successful backtick fd setup vs failing $() fd setup
-4. May require wasmer-wasix changes to fix
+This is **NOT** a wasmer-js scheduler-routed pipes issue - the pipes work correctly for backticks and shell pipelines. It's a bash-WASIX compatibility issue.
+
+### Fixes Applied
+
+**VirtualPipe Poll Guard Support (commit `ebf9a024e`):**
+Added VirtualPipeTx and VirtualPipeRx handling to `InodeValFilePollGuard::new()` in wasmer-wasix. Previously, polling on VirtualPipe fds would return `Errno::Badf`.
+
+This fix enables proper poll_oneoff support for scheduler-routed pipes, though it didn't resolve the $() issue (since $() fails before creating pipes).
+
+### Future Investigation
+
+The $() issue requires investigation at the bash-WASIX interface level:
+1. Trace bash's internal command_substitute() function behavior
+2. Check what system call or check bash makes before creating the pipe for $()
+3. May require changes to the bash WASM package or wasix-libc
 
 ## Architecture
 
