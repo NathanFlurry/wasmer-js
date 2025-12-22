@@ -1,3 +1,13 @@
+# Available wasmer/* packages from the registry:
+#   Shells:      wasmer/bash
+#   Utilities:   wasmer/coreutils
+#   Languages:   wasmer/python, wasmer/php, wasmer/lua
+#   Editors:     wasmer/neatvi
+#   Media:       wasmer/ffmpeg
+#   Web:         wasmer/static-web-server, wasmer/winterjs
+#   Data:        wasmer/sqlite
+#   Tools:       wasmer/clang, wasmer/qjs (QuickJS)
+
 [package]
 name = "wasmer/wasmer-sh"
 version = "0.4.21"
