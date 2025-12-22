@@ -2,50 +2,59 @@
 
 ## Summary
 
-`$()` command substitution fails silently in bash running on wasmer-js, while backticks work correctly.
+`$()` command substitution fails silently with `sharrattj/bash` but works correctly with `wasmer/bash`.
+
+## Solution
+
+**Use `wasmer/bash` instead of `sharrattj/bash`**:
+
+```javascript
+// This works correctly
+const pkg = await Wasmer.fromRegistry("wasmer/bash");
+let instance = await pkg.commands["bash"].run({ args: ["-c", "echo $(echo hello)"] });
+let result = await instance.wait();
+console.log(result.stdout); // "hello\n"
+```
 
 ## Current Status
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| `` `cmd` `` | ✅ Works | Simple backticks |
-| `` `echo \`nested\`` `` | ✅ Works | Fixed in commit `57f0d76b5` |
-| `$(cmd)` | ❌ Fails | Requires `/dev/fd` (see below) |
-| `(subshell)` | ✅ Works | No pipe capture needed |
-| `$((1+1))` | ✅ Works | Arithmetic, no fork |
-| `echo \| cat` | ✅ Works | Shell pipelines work |
+| Feature | wasmer/bash | sharrattj/bash |
+|---------|-------------|----------------|
+| `` `cmd` `` | ✅ Works | ✅ Works |
+| `` `echo \`nested\`` `` | ✅ Works | ✅ Works (fixed) |
+| `$(cmd)` | ✅ Works | ❌ Broken (package bug) |
+| `$($(nested))` | ✅ Works | ❌ Broken |
+| `<(process sub)` | ❌ Needs `/dev/fd` | ❌ Needs `/dev/fd` |
+| `(subshell)` | ✅ Works | ✅ Works |
+| `$((1+1))` | ✅ Works | ✅ Works |
 
 ## Root Cause
+
+### $() with sharrattj/bash
+
+The `sharrattj/bash` package has a bug that causes `$()` command substitution to fail silently. This is **NOT** a WASIX issue - the `wasmer/bash` package works correctly.
+
+The exact cause in the sharrattj/bash build is unknown, but it appears to be a compilation or configuration issue specific to that package.
 
 ### Nested Backticks (Fixed)
 
 Nested backticks previously failed with "cannot duplicate pipe as fd 1: Invalid argument".
 
-**Root cause**: When `fd_renumber(pipe_fd, 1)` was called in a nested subprocess, the flush operation on fd 1 (stdout) failed because stdout had been replaced with a VirtualPipe by the outer subprocess. The `flush()` function expected fd 1 to be `Kind::File`, but it was a VirtualPipe.
+**Root cause**: When `fd_renumber(pipe_fd, 1)` was called in a nested subprocess, the flush operation on fd 1 (stdout) failed because stdout had been replaced with a VirtualPipe by the outer subprocess.
 
-**Fix**: Modified `flush()` in `fs/mod.rs` to handle the `FsError::NotAFile` case for stdio fds gracefully, since pipes don't require explicit flushing.
+**Fix**: Modified `flush()` in `fs/mod.rs` to handle the `FsError::NotAFile` case for stdio fds gracefully.
 
 **Commit**: `57f0d76b5` in wasmer
 
-### $() Command Substitution (Not Yet Fixed)
+### Process Substitution `<()`
 
-`$()` fails because the `sharrattj/bash` package was compiled with `HAVE_DEV_FD` enabled, which requires `/dev/fd` to be available. WASIX does not provide `/dev/fd`.
+Process substitution like `cat <(echo hello)` fails with both bash packages because it requires `/dev/fd` which WASIX does not provide:
 
-**Evidence**:
-```bash
-ls -la /dev/fd 2>&1
-# ls: cannot access '/dev/fd': No such file or directory
+```
+cat: /dev/fd/63: No such file or directory
 ```
 
-Bash uses `/dev/fd/<n>` to pass file descriptors between processes for `$()` substitution. Without it, bash silently fails before even attempting to create pipes.
-
-Backticks use an older code path that doesn't rely on `/dev/fd`.
-
-## Solutions for $()
-
-1. **Add `/dev/fd` support to WASIX**: Implement a virtual `/dev/fd` filesystem that maps `/dev/fd/N` to file descriptor N. This is the proper fix.
-
-2. **Rebuild bash without `HAVE_DEV_FD`**: Build a new bash package with `--disable-dev-fd-stat-broken` or similar configure options. Bash will fall back to using named pipes (FIFOs).
+**Solution**: Add virtual `/dev/fd` support to WASIX (future work).
 
 ## Fixes Applied
 
@@ -77,21 +86,22 @@ __WASI_STDOUT_FILENO => {
 ## Test Script
 
 ```javascript
-import { init, Wasmer } from '@anthropic/wasmer-sdk';
+import { init, Wasmer } from '@wasmer/sdk';
 
 await init();
-const pkg = await Wasmer.fromRegistry("sharrattj/bash");
 
-// These work
-let r1 = await pkg.commands["bash"].run({ args: ["-c", "echo `echo hello`"] });
+// Use wasmer/bash for full $() support
+const pkg = await Wasmer.fromRegistry("wasmer/bash");
+
+// All of these work with wasmer/bash
+let r1 = await pkg.commands["bash"].run({ args: ["-c", "echo $(echo hello)"] });
 console.log((await r1.wait()).stdout); // "hello\n"
 
-let r2 = await pkg.commands["bash"].run({ args: ["-c", "echo `echo \\`echo nested\\``"] });
+let r2 = await pkg.commands["bash"].run({ args: ["-c", "echo $(echo $(echo nested))"] });
 console.log((await r2.wait()).stdout); // "nested\n"
 
-// This fails (needs /dev/fd)
-let r3 = await pkg.commands["bash"].run({ args: ["-c", "echo $(echo hello)"] });
-console.log((await r3.wait()).stdout); // ""
+let r3 = await pkg.commands["bash"].run({ args: ["-c", "for i in $(seq 1 3); do echo $i; done"] });
+console.log((await r3.wait()).stdout); // "1\n2\n3\n"
 ```
 
 ## References
