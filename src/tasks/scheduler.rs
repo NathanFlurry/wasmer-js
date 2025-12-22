@@ -118,12 +118,20 @@ impl Scheduler {
         tracing::debug!(thread_id, "Spinning up the scheduler");
         wasm_bindgen_futures::spawn_local(
             async move {
+                let mut msg_count = 0u64;
                 while let Some(msg) = receiver.recv().await {
+                    msg_count += 1;
+                    // Log every 50th message to avoid spam
+                    if msg_count % 50 == 0 {
+                        web_sys::console::log_1(&format!("[scheduler] Processed {} messages", msg_count).into());
+                    }
                     tracing::trace!(?msg, "Executing a message");
                     if let SchedulerMessage::Close = msg {
+                        web_sys::console::log_1(&"[scheduler] Received Close, shutting down".into());
                         break;
                     }
                     if let Err(e) = scheduler.execute(msg) {
+                        web_sys::console::error_1(&format!("[scheduler] Error: {:?}", e).into());
                         tracing::error!(error = &*e, "An error occurred while handling a message");
                     }
                 }
@@ -261,6 +269,13 @@ impl SchedulerState {
                 tracing::debug!("Scheduler received Close message");
                 self.idle.clear();
                 // self.busy.clear();
+
+                // NOTE: We do NOT clear static state (PIPE_BUFFERS, etc.) here because
+                // a new scheduler may already be running and using those resources.
+                // The static state is keyed by unique IDs (pipe_id, session_id) from
+                // global atomic counters, so there's no conflict between schedulers.
+                // Old entries will be cleaned up when they're accessed by stale IDs.
+
                 Ok(())
             }
             SchedulerMessage::SpawnAsync(task) => {
@@ -309,6 +324,10 @@ impl SchedulerState {
             }
             SchedulerMessage::WorkerBusy { worker_id } => {
                 move_worker(worker_id, &mut self.idle, &mut self.busy);
+                web_sys::console::log_1(&format!(
+                    "[scheduler] WorkerBusy {}: idle={} busy={}",
+                    worker_id, self.idle.len(), self.busy.len()
+                ).into());
                 tracing::trace!(
                     worker.id=worker_id,
                     idle_workers=?self.idle.iter().map(|w| w.id()).collect::<Vec<_>>(),
@@ -319,6 +338,10 @@ impl SchedulerState {
             }
             SchedulerMessage::WorkerIdle { worker_id } => {
                 move_worker(worker_id, &mut self.busy, &mut self.idle);
+                web_sys::console::log_1(&format!(
+                    "[scheduler] WorkerIdle {}: idle={} busy={}",
+                    worker_id, self.idle.len(), self.busy.len()
+                ).into());
                 tracing::trace!(
                     worker.id=worker_id,
                     idle_workers=?self.idle.iter().map(|w| w.id()).collect::<Vec<_>>(),
@@ -622,12 +645,12 @@ impl SchedulerState {
                 Ok(())
             }
             SchedulerMessage::PipeCreate { pipe_id, worker_id: _ } => {
-                tracing::debug!(pipe_id, "Creating pipe buffer");
+                web_sys::console::log_1(&format!("[pipe] Create pipe_id={}", pipe_id).into());
                 PIPE_BUFFERS.lock().unwrap().insert(pipe_id, PipeBuffer::default());
                 Ok(())
             }
             SchedulerMessage::PipeWrite { pipe_id, worker_id: _, data } => {
-                tracing::trace!(pipe_id, data_len = data.len(), "Pipe write");
+                web_sys::console::log_1(&format!("[pipe] Write pipe_id={} len={}", pipe_id, data.len()).into());
                 let mut buffers = PIPE_BUFFERS.lock().unwrap();
                 if let Some(buffer) = buffers.get_mut(&pipe_id) {
                     buffer.data.extend(data);
@@ -644,7 +667,7 @@ impl SchedulerState {
                 Ok(())
             }
             SchedulerMessage::PipeRead { pipe_id, worker_id, max_len } => {
-                tracing::trace!(pipe_id, worker_id, max_len, "Pipe read request");
+                web_sys::console::log_1(&format!("[pipe] Read pipe_id={} worker={} max_len={}", pipe_id, worker_id, max_len).into());
                 let mut buffers = PIPE_BUFFERS.lock().unwrap();
                 if let Some(buffer) = buffers.get_mut(&pipe_id) {
                     if !buffer.data.is_empty() {
@@ -659,6 +682,10 @@ impl SchedulerState {
                         self.send_pipe_read_response(worker_id, pipe_id, None)?;
                     } else {
                         // No data yet, store pending read
+                        web_sys::console::log_1(&format!(
+                            "[pipe] Read pending: pipe={} worker={}",
+                            pipe_id, worker_id
+                        ).into());
                         buffer.pending_read = Some((worker_id, max_len));
                     }
                 } else {
@@ -670,7 +697,7 @@ impl SchedulerState {
                 Ok(())
             }
             SchedulerMessage::PipeClose { pipe_id, worker_id: _ } => {
-                tracing::debug!(pipe_id, "Pipe close");
+                web_sys::console::log_1(&format!("[pipe] Close pipe_id={}", pipe_id).into());
                 let mut buffers = PIPE_BUFFERS.lock().unwrap();
                 if let Some(buffer) = buffers.get_mut(&pipe_id) {
                     buffer.closed = true;
@@ -812,6 +839,11 @@ impl SchedulerState {
     }
 
     fn send_pipe_read_response(&mut self, worker_id: u32, pipe_id: u64, data: Option<Vec<u8>>) -> Result<(), Error> {
+        web_sys::console::log_1(&format!(
+            "[pipe] send_pipe_read_response worker={} pipe={} data={:?}",
+            worker_id, pipe_id, data.as_ref().map(|d| d.len())
+        ).into());
+
         // Find the worker and send response via SharedArrayBuffer + Atomics
         for worker in self.idle.iter().chain(self.busy.iter()) {
             if worker.id() == worker_id {
@@ -887,12 +919,22 @@ impl SchedulerState {
     }
 
     fn next_available_worker(&mut self) -> Result<WorkerHandle, Error> {
+        web_sys::console::log_1(&format!(
+            "[scheduler] next_available_worker: idle={} busy={}",
+            self.idle.len(),
+            self.busy.len()
+        ).into());
+
         // First, try to send the message to an idle worker
         if let Some(worker) = self.idle.pop_front() {
             tracing::trace!(
                 worker.id = worker.id(),
                 "Sending the message to an idle worker"
             );
+            web_sys::console::log_1(&format!(
+                "[scheduler] Using idle worker {}",
+                worker.id()
+            ).into());
             return Ok(worker);
         }
 
@@ -904,6 +946,10 @@ impl SchedulerState {
             worker.id = worker.id(),
             "Sending the message to a new worker"
         );
+        web_sys::console::log_1(&format!(
+            "[scheduler] Started new worker {}",
+            worker.id()
+        ).into());
         Ok(worker)
     }
 
