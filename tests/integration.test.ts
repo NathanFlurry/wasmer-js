@@ -138,7 +138,7 @@ describe("Wasmer.spawn", function () {
   });
 
   it("can communicate with a subprocess interactively", async () => {
-    const pkg = await Wasmer.fromRegistry("sharrattj/bash");
+    const pkg = await Wasmer.fromRegistry("wasmer/bash");
     const instance = await pkg.commands["bash"].run({
       uses: ["christoph/wasix-test-stdinout@0.1.1"],
     });
@@ -226,7 +226,7 @@ describe("Wasmer.spawn", function () {
 
   it("can see a mounted directory", async () => {
     const dir = new Directory();
-    const pkg = await Wasmer.fromRegistry("sharrattj/coreutils");
+    const pkg = await Wasmer.fromRegistry("wasmer/coreutils");
 
     const instance = await pkg.commands["ls"].run({
       args: ["/"],
@@ -242,7 +242,7 @@ describe("Wasmer.spawn", function () {
   it("can see files in a mounted directory", async () => {
     const dir = new Directory();
     await dir.writeFile("/file.txt", new Uint8Array());
-    const pkg = await Wasmer.fromRegistry("sharrattj/coreutils");
+    const pkg = await Wasmer.fromRegistry("wasmer/coreutils");
 
     const instance = await pkg.commands["ls"].run({
       stdin: "",
@@ -259,7 +259,7 @@ describe("Wasmer.spawn", function () {
   it("can read from a mounted file", async () => {
     const dir = new Directory();
     await dir.writeFile("/file.txt", encoder.encode("Hello, World!"));
-    const pkg = await Wasmer.fromRegistry("sharrattj/coreutils");
+    const pkg = await Wasmer.fromRegistry("wasmer/coreutils");
 
     const instance = await pkg.commands["cat"].run({
       args: ["/mounted/file.txt"],
@@ -275,7 +275,7 @@ describe("Wasmer.spawn", function () {
   it("can delete files from a mounted directory", async () => {
     const dir = new Directory();
     await dir.writeFile("/file.txt", encoder.encode("Hello, World!"));
-    const pkg = await Wasmer.fromRegistry("sharrattj/coreutils");
+    const pkg = await Wasmer.fromRegistry("wasmer/coreutils");
 
     const instance = await pkg.commands["rm"].run({
       args: ["/mounted/file.txt"],
@@ -290,7 +290,7 @@ describe("Wasmer.spawn", function () {
   it("can delete directories from a mounted directory", async () => {
     const dir = new Directory();
     await dir.createDir("/nested-dir");
-    const pkg = await Wasmer.fromRegistry("sharrattj/coreutils");
+    const pkg = await Wasmer.fromRegistry("wasmer/coreutils");
 
     const instance = await pkg.commands["rmdir"].run({
       args: ["/mounted/nested-dir"],
@@ -304,7 +304,7 @@ describe("Wasmer.spawn", function () {
 
   it("can write to a mounted directory", async () => {
     const dir = new Directory();
-    const pkg = await Wasmer.fromRegistry("sharrattj/bash");
+    const pkg = await Wasmer.fromRegistry("wasmer/bash");
 
     const instance = await pkg.commands["bash"].run({
       args: ["-c", "echo 'Something else' > /mounted/another-file.txt"],
@@ -333,7 +333,7 @@ describe.skip("failing tty handling tests", function () {
   });
 
   it("can run a bash session non-interactively", async () => {
-    const pkg = await Wasmer.fromRegistry("sharrattj/bash");
+    const pkg = await Wasmer.fromRegistry("wasmer/bash");
 
     const instance = await pkg.commands["bash"].run({
       stdin: "ls / && exit 42\n",
@@ -348,7 +348,7 @@ describe.skip("failing tty handling tests", function () {
   });
 
   it.skip("can communicate with a subprocess", async () => {
-    const pkg = await Wasmer.fromRegistry("sharrattj/bash");
+    const pkg = await Wasmer.fromRegistry("wasmer/bash");
 
     const instance = await pkg.commands["bash"].run({
       uses: ["christoph/wasix-test-stdinout@0.1.1"],

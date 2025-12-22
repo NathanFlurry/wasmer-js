@@ -9,8 +9,8 @@ import WasmModule from "@wasmer/sdk/wasm?url";
 const encoder = new TextEncoder();
 const params = new URLSearchParams(window.location.search);
 
-const packageName = params.get("package") || "sharrattj/bash";
-const uses = packageName == "sharrattj/bash" ? ["wasmer/neatvi"] : params.getAll("use");
+const packageName = params.get("package") || "wasmer/bash";
+const uses = packageName == "wasmer/bash" ? ["wasmer/neatvi"] : params.getAll("use");
 
 const args = params.getAll("arg");
 const logFilter = params.get("log") || "trace";
